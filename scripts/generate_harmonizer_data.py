@@ -64,6 +64,10 @@ parser.add_argument("--num-envs", type=int, default=1,
                     help="Forwarded to create_env. Must be 1 for the current paired-data pipeline.")
 parser.add_argument("--orbit-cameras", type=int, default=8,
                     help="Number of orbit cameras used by ISP/relighting/shadow when sphere capture is skipped.")
+parser.add_argument("--physx-buffer-scale", type=float, default=0.1,
+                    help="Multiplier on Isaac Lab's GPU PhysX buffer defaults. 0.1 (default) keeps a single env "
+                         "well under 1 GB of PhysX scratch; raise toward 1.0 if you have a large 24+ GB GPU and "
+                         "see physx contact-buffer overflow warnings.")
 
 parser.add_argument("--no-headless", dest="headless_override", action="store_false", default=True,
                     help="Open the Isaac Sim GUI; default is headless since this script is offline data-gen.")
@@ -127,6 +131,7 @@ def main() -> None:
         device=getattr(args_cli, "device", "cuda:0"),
         num_envs=args_cli.num_envs,
         orbit_cameras=args_cli.orbit_cameras,
+        physx_buffer_scale=args_cli.physx_buffer_scale,
     )
     print(f"[harmonizer] running on {len(env_names)} env(s) -> {cfg.output_root}")
     summary = run_pipeline(cfg, env_names=env_names)

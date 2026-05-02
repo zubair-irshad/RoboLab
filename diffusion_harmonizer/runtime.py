@@ -49,8 +49,19 @@ class CameraSpec:
 class HarmonizerRuntime:
     """Live wrapper over a RoboLab env tailored to paired-data generation."""
 
-    def __init__(self, env_name: str, *, device: str = "cuda:0", seed: int = 0, instruction_type: str = "default", env_index: int = 0, num_envs: int = 1):
+    def __init__(
+        self,
+        env_name: str,
+        *,
+        device: str = "cuda:0",
+        seed: int = 0,
+        instruction_type: str = "default",
+        env_index: int = 0,
+        num_envs: int = 1,
+        physx_buffer_scale: float = 0.1,
+    ):
         # Imports are deferred so this module is importable without Isaac Sim.
+        from robolab.core.environments.config import parse_env_cfg
         from robolab.core.environments.runtime import create_env, end_episode  # noqa
         import omni.replicator.core as rep
         import omni.usd
@@ -61,8 +72,20 @@ class HarmonizerRuntime:
 
         self.env_name = env_name
         self.env_index = env_index
+
+        # Build cfg first so we can shrink the GPU PhysX scratch buffers before
+        # the env is constructed. Isaac Lab's defaults (1 GB collision stack,
+        # 1 GB heap, 1 GB temp, 8M contacts) are tuned for many-env parallel
+        # training and OOM small-VRAM cards on a single env. For data-gen we
+        # only need a fraction of that.
+        env_cfg = parse_env_cfg(
+            env_name, device=device, seed=seed, num_envs=num_envs, use_fabric=True,
+        )
+        if device.startswith("cuda") and physx_buffer_scale > 0 and physx_buffer_scale < 1.0:
+            _shrink_gpu_physx_buffers(env_cfg, physx_buffer_scale)
+
         self.env, self.env_cfg = create_env(
-            scene=env_name,
+            scene=env_cfg,
             device=device,
             seed=seed,
             num_envs=num_envs,
@@ -417,6 +440,40 @@ class HarmonizerRuntime:
 def _looks_like_receiver(name: str) -> bool:
     low = name.lower()
     return any(hint in low for hint in _RECEIVER_NAME_HINTS)
+
+
+def _shrink_gpu_physx_buffers(env_cfg, scale: float) -> None:
+    """Reduce Isaac Lab's GPU PhysX buffer sizes for single-env data gen.
+
+    Isaac Lab's defaults assume parallel training with hundreds of envs.
+    On an 8 GB card running a single env those buffers — 1 GB collision
+    stack, 1 GB heap, 1 GB temp, 8 M contacts — push PhysX into OOM long
+    before rendering even starts. We scale them down (default 0.1×) but
+    floor each to a value that still works for typical manipulation scenes.
+    """
+
+    physx = getattr(getattr(env_cfg, "sim", None), "physx", None)
+    if physx is None:
+        return
+    floors_and_defaults = {
+        "gpu_max_rigid_contact_count":            ( 524_288, 8_388_608),
+        "gpu_max_rigid_patch_count":              (  32_768,   163_840),
+        "gpu_found_lost_pairs_capacity":          ( 131_072, 2_097_152),
+        "gpu_found_lost_aggregate_pairs_capacity":( 524_288, 33_554_432),
+        "gpu_total_aggregate_pairs_capacity":     ( 131_072, 2_097_152),
+        "gpu_collision_stack_size":               (67_108_864, 1_073_741_824),  # 64 MB floor, 1 GB default
+        "gpu_heap_capacity":                      (67_108_864, 1_073_741_824),
+        "gpu_temp_buffer_capacity":               (67_108_864, 1_073_741_824),
+        "gpu_max_soft_body_contacts":             (  65_536, 1_048_576),
+        "gpu_max_particle_contacts":              (  65_536, 1_048_576),
+    }
+    for field, (floor, default) in floors_and_defaults.items():
+        current = getattr(physx, field, default)
+        scaled = max(int(floor), int(current * scale))
+        try:
+            setattr(physx, field, scaled)
+        except Exception:
+            pass
 
 
 def _set_xform_op(xf, op_type, value, *, double: bool) -> None:

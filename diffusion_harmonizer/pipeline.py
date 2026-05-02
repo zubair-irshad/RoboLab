@@ -58,6 +58,7 @@ class PipelineConfig:
     device: str = "cuda:0"  # pass "cpu" to fall back to CPU PhysX on memory-constrained GPUs
     num_envs: int = 1
     orbit_cameras: int = 8  # used by ISP/relighting/shadow when sphere cameras aren't built
+    physx_buffer_scale: float = 0.1  # 0.1 = 10% of Isaac Lab's parallel-training defaults; raise for big scenes
     components: tuple[str, ...] = (
         "artifacts_correction",
         "isp_modification",
@@ -102,7 +103,13 @@ def _run_env(env_name: str, cfg: PipelineConfig) -> dict[str, Any]:
     env_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n[pipeline] === env {env_name} ===", flush=True)
 
-    runtime = HarmonizerRuntime(env_name=env_name, seed=cfg.seed, device=cfg.device, num_envs=cfg.num_envs)
+    runtime = HarmonizerRuntime(
+        env_name=env_name,
+        seed=cfg.seed,
+        device=cfg.device,
+        num_envs=cfg.num_envs,
+        physx_buffer_scale=cfg.physx_buffer_scale,
+    )
     summary: dict[str, Any] = {
         "env_name": env_name,
         "instruction": getattr(runtime.env_cfg, "instruction", None),
@@ -233,7 +240,22 @@ def _run_env(env_name: str, cfg: PipelineConfig) -> dict[str, Any]:
         _write_index(env_dir, summary)
     finally:
         runtime.close()
+        _release_cuda_memory()
     return summary
+
+
+def _release_cuda_memory() -> None:
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
 
 
 def _save_preview(runtime, preview_dir: Path, presets) -> None:
