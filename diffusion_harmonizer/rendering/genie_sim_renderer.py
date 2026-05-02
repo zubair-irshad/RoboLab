@@ -100,11 +100,10 @@ class GenieSimRenderer:
         if not prim.GetReferences().AddReference(str(asset_path)):
             raise RuntimeError(f"Failed to add USD reference {asset_path} at {prim_path}")
         xf = UsdGeom.Xformable(prim)
-        self._clear_xform_ops(xf)
-        xf.AddTranslateOp().Set(Gf.Vec3d(*translate))
         rx, ry, rz = rotate
-        xf.AddRotateXYZOp().Set(Gf.Vec3f(rx, ry, rz))
-        xf.AddScaleOp().Set(Gf.Vec3f(*scale))
+        _set_or_add_xform_op(xf, UsdGeom.XformOp.TypeTranslate, tuple(translate))
+        _set_or_add_xform_op(xf, UsdGeom.XformOp.TypeRotateXYZ, (rx, ry, rz))
+        _set_or_add_xform_op(xf, UsdGeom.XformOp.TypeScale, tuple(scale))
 
     def set_prim_transform(
         self,
@@ -119,10 +118,9 @@ class GenieSimRenderer:
         if not prim.IsValid():
             return
         xf = UsdGeom.Xformable(prim)
-        self._clear_xform_ops(xf)
-        xf.AddTranslateOp().Set(Gf.Vec3d(*translate))
-        xf.AddRotateXYZOp().Set(Gf.Vec3f(*rotate))
-        xf.AddScaleOp().Set(Gf.Vec3f(*scale))
+        _set_or_add_xform_op(xf, UsdGeom.XformOp.TypeTranslate, tuple(translate))
+        _set_or_add_xform_op(xf, UsdGeom.XformOp.TypeRotateXYZ, tuple(rotate))
+        _set_or_add_xform_op(xf, UsdGeom.XformOp.TypeScale, tuple(scale))
 
     def align_prim_bottom_to_z(self, prim_path: str, target_z: float) -> float | None:
         """Shift a prim so its world-space bounding-box bottom sits on `target_z`."""
@@ -689,3 +687,30 @@ class GenieSimRenderer:
             z = 0.25 * s
         n = math.sqrt(w * w + x * x + y * y + z * z)
         return (w / n, x / n, y / n, z / n)
+
+
+def _set_or_add_xform_op(xf, op_type, value: tuple) -> None:
+    """Idempotent xform-op setter that respects existing precision.
+
+    Authoring a fresh ``Vec3f`` op when the prim already carries a ``double3``
+    op of the same name raises ``Tf.ErrorException`` in strict-mode USD. The
+    safe path is: reuse the existing op when present, fall back to adding a
+    new one with whatever precision matches the input dtype.
+    """
+
+    from pxr import Gf, UsdGeom
+
+    existing = next((op for op in xf.GetOrderedXformOps() if op.GetOpType() == op_type), None)
+    if existing is not None:
+        precision = existing.GetPrecision()
+        if precision == UsdGeom.XformOp.PrecisionDouble:
+            existing.Set(Gf.Vec3d(*[float(c) for c in value]))
+        else:
+            existing.Set(Gf.Vec3f(*[float(c) for c in value]))
+        return
+    if op_type == UsdGeom.XformOp.TypeTranslate:
+        xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(Gf.Vec3d(*[float(c) for c in value]))
+    elif op_type == UsdGeom.XformOp.TypeRotateXYZ:
+        xf.AddRotateXYZOp(UsdGeom.XformOp.PrecisionFloat).Set(Gf.Vec3f(*[float(c) for c in value]))
+    elif op_type == UsdGeom.XformOp.TypeScale:
+        xf.AddScaleOp(UsdGeom.XformOp.PrecisionFloat).Set(Gf.Vec3f(*[float(c) for c in value]))
