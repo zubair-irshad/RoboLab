@@ -65,9 +65,16 @@ parser.add_argument("--num-envs", type=int, default=1,
 parser.add_argument("--orbit-cameras", type=int, default=8,
                     help="Number of orbit cameras used by ISP/relighting/shadow when sphere capture is skipped.")
 
+parser.add_argument("--no-headless", dest="headless_override", action="store_false", default=True,
+                    help="Open the Isaac Sim GUI; default is headless since this script is offline data-gen.")
+
 AppLauncher.add_app_launcher_args(parser)
 args_cli, _ = parser.parse_known_args()
 args_cli.enable_cameras = True
+# Default to headless mode for offline data generation. AppLauncher's --headless
+# is store_true (default False), so we force it on unless the user passes
+# --no-headless to override.
+args_cli.headless = bool(args_cli.headless_override)
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
