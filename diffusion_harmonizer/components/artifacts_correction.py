@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -37,22 +38,37 @@ def capture_sphere_views(
     num_cameras: int = 100,
     resolution: tuple[int, int] = (512, 512),
     name_prefix: str = "harmonizer_sphere",
+    spp: int = 64,
+    verbose: bool = True,
 ) -> tuple[list[str], list[CapturedView]]:
     """Add 100 Fibonacci-sphere cameras and capture rgb+depth from each."""
 
+    if verbose:
+        print(f"[capture] adding {num_cameras} sphere cameras at radius={radius}, res={resolution}", flush=True)
     cameras = renderer.add_sphere_cameras(name_prefix, center=center, radius=radius, num_cameras=num_cameras, resolution=resolution)
-    renderer.set_path_tracing(True, spp=64)
-    frames = renderer.capture_multiview(cameras, rgb=True, depth=True)
-    views = [
-        CapturedView(
-            rgb=frame["rgb"],
-            depth=frame.get("depth"),
-            intrinsics=np.asarray(frame["camera_intrinsics"], dtype=np.float32),
-            world_T_cam=np.asarray(frame["camera_extrinsics"], dtype=np.float32),
-            image_name=f"{idx:04d}.png",
+    renderer.set_path_tracing(spp > 1, spp=spp)
+    if verbose:
+        print(f"[capture] path-tracing spp={spp}; rendering {num_cameras} frames...", flush=True)
+    views: list[CapturedView] = []
+    t0 = time.time()
+    for idx, name in enumerate(cameras):
+        frame = renderer.capture_frame(name, rgb=True, depth=True)
+        views.append(
+            CapturedView(
+                rgb=frame["rgb"],
+                depth=frame.get("depth"),
+                intrinsics=np.asarray(frame["camera_intrinsics"], dtype=np.float32),
+                world_T_cam=np.asarray(frame["camera_extrinsics"], dtype=np.float32),
+                image_name=f"{idx:04d}.png",
+            )
         )
-        for idx, frame in enumerate(frames)
-    ]
+        if verbose and (idx + 1) % 10 == 0:
+            elapsed = time.time() - t0
+            rate = (idx + 1) / max(elapsed, 1e-3)
+            eta = (num_cameras - (idx + 1)) / max(rate, 1e-3)
+            print(f"[capture] {idx + 1}/{num_cameras} frames ({rate:.2f} fps, eta {eta:.1f}s)", flush=True)
+    if verbose:
+        print(f"[capture] done in {time.time() - t0:.1f}s", flush=True)
     return cameras, views
 
 
@@ -126,7 +142,9 @@ def generate_pairs(
     full_iterations: int = 30000,
     splat_kind: str = "3dgs",
     seed: int = 42,
+    spp: int = 64,
     captured_views: list[CapturedView] | None = None,
+    verbose: bool = True,
 ) -> dict[str, dict[str, str]]:
     output = Path(output_dir)
     if captured_views is None:
@@ -136,18 +154,27 @@ def generate_pairs(
             radius=sphere_radius,
             num_cameras=num_cameras,
             resolution=resolution,
+            spp=spp,
+            verbose=verbose,
         )
+    if verbose:
+        print(f"[artifacts] exporting privileged {len(captured_views)}-view capture", flush=True)
     export_capture_dataset(captured_views, output / "privileged_capture")
 
     cfg = GSplatConfig(iterations=full_iterations, splat_kind=splat_kind, seed=seed)
     reference_strategy = build_full_reference_strategy(len(captured_views), full_iters=full_iterations)
     degraded_strategies = default_degraded_strategies(len(captured_views), full_iters=full_iterations)
 
+    progress_cb = None
+    if verbose:
+        def progress_cb(strategy_name: str, step: int, loss: float) -> None:
+            print(f"[gsplat:{strategy_name}] step {step:>6d}  loss {loss:.4f}", flush=True)
     artifacts = run_strategy_suite(
         captured_views,
         cfg,
         strategies=[reference_strategy] + degraded_strategies,
         output_root=output / "renders",
+        progress_cb=progress_cb,
     )
     reference = artifacts[reference_strategy.name]
     degraded = [artifacts[s.name] for s in degraded_strategies if s.name in artifacts]

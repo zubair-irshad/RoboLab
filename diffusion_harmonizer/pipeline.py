@@ -54,6 +54,7 @@ class PipelineConfig:
     sphere_center: tuple[float, float, float] = (0.4, 0.0, 0.4)
     capture_resolution: tuple[int, int] = (512, 512)
     splat_kind: str = "3dgs"  # or "2dgs"
+    spp: int = 64  # samples-per-pixel for path-traced sphere capture
     full_iterations: int = 30000
     artifacts_pairs_per_scene: int = 40
     isp_pairs_per_scene: int = 12
@@ -132,6 +133,12 @@ def _run_scene(renderer, spec: RoboLabSceneSpec, cfg: PipelineConfig) -> dict[st
         "components": {},
     }
 
+    print(f"[pipeline] === scene {spec.scene_id} ===", flush=True)
+    print(f"[pipeline]   scene_usda: {spec.scene_usda}", flush=True)
+    print(f"[pipeline]   robot_usd:  {spec.robot_usd}", flush=True)
+    print(f"[pipeline]   hdri:       {spec.hdri_path}", flush=True)
+    print(f"[pipeline]   foreground_prims: {spec.foreground_prim_paths}", flush=True)
+
     # Fresh stage per scene so prim paths and camera lists don't leak between scenes.
     renderer.world.clear() if hasattr(renderer.world, "clear") else None
     renderer.cameras.clear()
@@ -140,11 +147,13 @@ def _run_scene(renderer, spec: RoboLabSceneSpec, cfg: PipelineConfig) -> dict[st
     reference_scene_into_renderer(renderer, spec)
     renderer.step(4)
 
+    print(f"[pipeline:{spec.scene_id}] saving 4 preview cameras", flush=True)
     _save_scene_preview(renderer, spec, scene_dir / "preview")
 
     foreground_paths = spec.foreground_prim_paths
 
     if "artifacts_correction" in cfg.components:
+        print(f"[pipeline:{spec.scene_id}] >>> 01_artifacts_correction", flush=True)
         ac_dir = scene_dir / "01_artifacts_correction"
         cameras, captured_views = artifacts_correction.capture_sphere_views(
             renderer,
@@ -153,6 +162,7 @@ def _run_scene(renderer, spec: RoboLabSceneSpec, cfg: PipelineConfig) -> dict[st
             num_cameras=cfg.num_sphere_cameras,
             resolution=cfg.capture_resolution,
             name_prefix=f"{spec.scene_id}_sphere",
+            spp=cfg.spp,
         )
         entries = artifacts_correction.generate_pairs(
             renderer,
@@ -161,14 +171,17 @@ def _run_scene(renderer, spec: RoboLabSceneSpec, cfg: PipelineConfig) -> dict[st
             full_iterations=cfg.full_iterations,
             splat_kind=cfg.splat_kind,
             seed=cfg.seed,
+            spp=cfg.spp,
             captured_views=captured_views,
         )
+        print(f"[pipeline:{spec.scene_id}] <<< 01_artifacts_correction wrote {len(entries)} pairs", flush=True)
         summary["components"]["artifacts_correction"] = {"output_dir": str(ac_dir), "num_pairs": len(entries)}
     else:
         cameras = []
         captured_views = []
 
     if "isp_modification" in cfg.components:
+        print(f"[pipeline:{spec.scene_id}] >>> 02_isp_modification", flush=True)
         isp_dir = scene_dir / "02_isp_modification"
         entries = isp_modification.generate_pairs(
             renderer,
@@ -181,6 +194,7 @@ def _run_scene(renderer, spec: RoboLabSceneSpec, cfg: PipelineConfig) -> dict[st
         summary["components"]["isp_modification"] = {"output_dir": str(isp_dir), "num_pairs": len(entries)}
 
     if "relighting" in cfg.components:
+        print(f"[pipeline:{spec.scene_id}] >>> 03_relighting", flush=True)
         rl_dir = scene_dir / "03_relighting"
         try:
             entries = relighting.generate_pairs(
@@ -196,6 +210,7 @@ def _run_scene(renderer, spec: RoboLabSceneSpec, cfg: PipelineConfig) -> dict[st
             summary["components"]["relighting"] = {"output_dir": str(rl_dir), "skipped": str(exc)}
 
     if "shadow_simulation" in cfg.components:
+        print(f"[pipeline:{spec.scene_id}] >>> 04_shadow_simulation", flush=True)
         shadow_dir = scene_dir / "04_shadow_simulation"
         entries = shadow_simulation.generate_pairs(
             renderer,
@@ -207,6 +222,7 @@ def _run_scene(renderer, spec: RoboLabSceneSpec, cfg: PipelineConfig) -> dict[st
         summary["components"]["shadow_simulation"] = {"output_dir": str(shadow_dir), "num_pairs": len(entries)}
 
     if "asset_reinsertion" in cfg.components:
+        print(f"[pipeline:{spec.scene_id}] >>> 05_asset_reinsertion", flush=True)
         reinsert_dir = scene_dir / "05_asset_reinsertion"
         entries = asset_reinsertion.generate_pairs(
             renderer,

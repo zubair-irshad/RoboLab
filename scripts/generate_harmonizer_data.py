@@ -53,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sphere-center", type=float, nargs=3, default=(0.4, 0.0, 0.4))
     parser.add_argument("--capture-resolution", type=int, nargs=2, default=(512, 512))
     parser.add_argument("--splat-kind", choices=("3dgs", "2dgs"), default="3dgs")
+    parser.add_argument("--spp", type=int, default=64,
+                        help="Samples-per-pixel for path-traced sphere capture. Lower (e.g. 8) for smoke tests.")
     parser.add_argument("--full-iterations", type=int, default=30000)
     parser.add_argument("--artifacts-pairs", type=int, default=40)
     parser.add_argument("--isp-pairs", type=int, default=12)
@@ -89,6 +91,7 @@ def main() -> None:
         sphere_center=tuple(args.sphere_center),
         capture_resolution=tuple(args.capture_resolution),
         splat_kind=args.splat_kind,
+        spp=args.spp,
         full_iterations=args.full_iterations,
         artifacts_pairs_per_scene=args.artifacts_pairs,
         isp_pairs_per_scene=args.isp_pairs,
