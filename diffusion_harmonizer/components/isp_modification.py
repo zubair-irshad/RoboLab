@@ -14,7 +14,7 @@ from diffusion_harmonizer.components.common import (
     foreground_mask_with_fallback,
     pair_id,
 )
-from diffusion_harmonizer.data.image_io import save_png, write_pair
+from diffusion_harmonizer.image_io import save_png, write_pair
 
 
 @dataclass

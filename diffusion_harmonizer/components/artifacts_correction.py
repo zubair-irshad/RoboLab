@@ -27,7 +27,7 @@ from diffusion_harmonizer.components.gsplat_trainer import (
     default_degraded_strategies,
     run_strategy_suite,
 )
-from diffusion_harmonizer.data.image_io import save_png, save_json, write_pair
+from diffusion_harmonizer.image_io import save_png, save_json, write_pair
 
 
 def capture_sphere_views(

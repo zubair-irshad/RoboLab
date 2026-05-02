@@ -24,7 +24,7 @@ from diffusion_harmonizer.components.gsplat_trainer import (
     build_full_reference_strategy,
     run_strategy_suite,
 )
-from diffusion_harmonizer.data.image_io import save_json, save_png, write_pair
+from diffusion_harmonizer.image_io import save_json, save_png, write_pair
 
 
 def capture_background_views(

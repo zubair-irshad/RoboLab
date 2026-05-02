@@ -38,7 +38,7 @@ from diffusion_harmonizer.components import (
     relighting,
     shadow_simulation,
 )
-from diffusion_harmonizer.data.image_io import save_json, save_png
+from diffusion_harmonizer.image_io import save_json, save_png
 from diffusion_harmonizer.scene_templates.robolab_loader import (
     RoboLabSceneSpec,
     discover_scenes,

@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from diffusion_harmonizer.components.common import discover_demo_cameras, feather_mask, foreground_mask, pair_id
-from diffusion_harmonizer.data.image_io import save_png, write_pair
+from diffusion_harmonizer.image_io import save_png, write_pair
 
 
 class RelightingModel:

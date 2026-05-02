@@ -338,7 +338,7 @@ def run_strategy_suite(
         strategies = [build_full_reference_strategy(len(views), cfg.iterations)] + default_degraded_strategies(len(views), cfg.iterations)
 
     artifacts: dict[str, StrategyArtifacts] = {}
-    from diffusion_harmonizer.data.image_io import save_png
+    from diffusion_harmonizer.image_io import save_png
 
     for strategy in strategies:
         local_cfg = GSplatConfig(**{**cfg.__dict__, "iterations": strategy.iterations})
