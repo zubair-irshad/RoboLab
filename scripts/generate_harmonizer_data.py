@@ -60,6 +60,10 @@ parser.add_argument("--relighting-command", default=None,
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--settle-steps", type=int, default=0,
                     help="Number of env.step() calls before capture. 0 (default) is enough — env.reset() already settles.")
+parser.add_argument("--num-envs", type=int, default=1,
+                    help="Forwarded to create_env. Must be 1 for the current paired-data pipeline.")
+parser.add_argument("--orbit-cameras", type=int, default=8,
+                    help="Number of orbit cameras used by ISP/relighting/shadow when sphere capture is skipped.")
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, _ = parser.parse_known_args()
@@ -113,6 +117,9 @@ def main() -> None:
         seed=args_cli.seed,
         settle_steps=args_cli.settle_steps,
         components=tuple(args_cli.components),
+        device=getattr(args_cli, "device", "cuda:0"),
+        num_envs=args_cli.num_envs,
+        orbit_cameras=args_cli.orbit_cameras,
     )
     print(f"[harmonizer] running on {len(env_names)} env(s) -> {cfg.output_root}")
     summary = run_pipeline(cfg, env_names=env_names)

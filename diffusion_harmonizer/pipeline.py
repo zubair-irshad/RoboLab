@@ -55,6 +55,9 @@ class PipelineConfig:
     relighting_command: str | None = None
     seed: int = 42
     settle_steps: int = 0  # 0 = skip stepping; env.reset() inside HarmonizerRuntime is enough
+    device: str = "cuda:0"  # pass "cpu" to fall back to CPU PhysX on memory-constrained GPUs
+    num_envs: int = 1
+    orbit_cameras: int = 8  # used by ISP/relighting/shadow when sphere cameras aren't built
     components: tuple[str, ...] = (
         "artifacts_correction",
         "isp_modification",
@@ -99,7 +102,7 @@ def _run_env(env_name: str, cfg: PipelineConfig) -> dict[str, Any]:
     env_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n[pipeline] === env {env_name} ===", flush=True)
 
-    runtime = HarmonizerRuntime(env_name=env_name, seed=cfg.seed)
+    runtime = HarmonizerRuntime(env_name=env_name, seed=cfg.seed, device=cfg.device, num_envs=cfg.num_envs)
     summary: dict[str, Any] = {
         "env_name": env_name,
         "instruction": getattr(runtime.env_cfg, "instruction", None),
@@ -118,14 +121,75 @@ def _run_env(env_name: str, cfg: PipelineConfig) -> dict[str, Any]:
             runtime.step(cfg.settle_steps)
         _save_preview(runtime, env_dir / "preview", cfg.preview_cameras)
 
-        sphere_cameras = runtime.add_sphere_cameras(
-            center=cfg.sphere_center,
-            radius=cfg.sphere_radius,
-            num_cameras=cfg.num_sphere_cameras,
-            resolution=cfg.capture_resolution,
-            name_prefix=f"sphere_{env_name}",
-        )
-        print(f"[pipeline:{env_name}] added {len(sphere_cameras)} spherical cameras", flush=True)
+        # Cheap single-view components only need an orbit ring of cameras.
+        orbit_cameras: list[str] = []
+        cheap_components = ("isp_modification", "relighting", "shadow_simulation")
+        if any(c in cfg.components for c in cheap_components):
+            orbit_cameras = runtime.add_orbit_cameras(
+                center=cfg.sphere_center,
+                radius=cfg.sphere_radius,
+                num_cameras=cfg.orbit_cameras,
+                resolution=cfg.capture_resolution,
+                name_prefix=f"orbit_{env_name}",
+            )
+            print(f"[pipeline:{env_name}] added {len(orbit_cameras)} orbit cameras", flush=True)
+
+        # Cheap components first: failing on heavy components later still leaves output.
+        if "isp_modification" in cfg.components:
+            print(f"[pipeline:{env_name}] >>> 02_isp_modification", flush=True)
+            entries = isp_modification.generate_pairs(
+                runtime,
+                cameras=orbit_cameras,
+                output_dir=env_dir / "02_isp_modification",
+                count=cfg.isp_pairs_per_env,
+                seed=cfg.seed,
+            )
+            summary["components"]["isp_modification"] = {"num_pairs": len(entries)}
+            print(f"[pipeline:{env_name}] <<< 02_isp_modification wrote {len(entries)} pairs", flush=True)
+
+        if "relighting" in cfg.components:
+            print(f"[pipeline:{env_name}] >>> 03_relighting", flush=True)
+            try:
+                entries = relighting.generate_pairs(
+                    runtime,
+                    cameras=orbit_cameras,
+                    output_dir=env_dir / "03_relighting",
+                    count=cfg.relighting_pairs_per_env,
+                    relighting_command=cfg.relighting_command,
+                    seed=cfg.seed,
+                )
+                summary["components"]["relighting"] = {"num_pairs": len(entries)}
+                print(f"[pipeline:{env_name}] <<< 03_relighting wrote {len(entries)} pairs", flush=True)
+            except RuntimeError as exc:
+                summary["components"]["relighting"] = {"skipped": str(exc)}
+                print(f"[pipeline:{env_name}] !!! 03_relighting skipped: {exc}", flush=True)
+
+        if "shadow_simulation" in cfg.components:
+            print(f"[pipeline:{env_name}] >>> 04_shadow_simulation", flush=True)
+            entries = shadow_simulation.generate_pairs(
+                runtime,
+                cameras=orbit_cameras,
+                output_dir=env_dir / "04_shadow_simulation",
+                count=cfg.shadow_pairs_per_env,
+                seed=cfg.seed,
+                hdri_roots=cfg.hdri_roots,
+                spp=cfg.spp,
+            )
+            summary["components"]["shadow_simulation"] = {"num_pairs": len(entries)}
+            print(f"[pipeline:{env_name}] <<< 04_shadow_simulation wrote {len(entries)} pairs", flush=True)
+
+        # Heavy components: build the 100-camera sphere only when needed.
+        sphere_components = ("artifacts_correction", "asset_reinsertion")
+        sphere_cameras: list[str] = []
+        if any(c in cfg.components for c in sphere_components):
+            sphere_cameras = runtime.add_sphere_cameras(
+                center=cfg.sphere_center,
+                radius=cfg.sphere_radius,
+                num_cameras=cfg.num_sphere_cameras,
+                resolution=cfg.capture_resolution,
+                name_prefix=f"sphere_{env_name}",
+            )
+            print(f"[pipeline:{env_name}] added {len(sphere_cameras)} spherical cameras", flush=True)
 
         captured_views = None
         if "artifacts_correction" in cfg.components:
@@ -144,49 +208,6 @@ def _run_env(env_name: str, cfg: PipelineConfig) -> dict[str, Any]:
             )
             summary["components"]["artifacts_correction"] = {"num_pairs": len(entries)}
             print(f"[pipeline:{env_name}] <<< 01_artifacts_correction wrote {len(entries)} pairs", flush=True)
-
-        if "isp_modification" in cfg.components:
-            print(f"[pipeline:{env_name}] >>> 02_isp_modification", flush=True)
-            entries = isp_modification.generate_pairs(
-                runtime,
-                cameras=sphere_cameras,
-                output_dir=env_dir / "02_isp_modification",
-                count=cfg.isp_pairs_per_env,
-                seed=cfg.seed,
-            )
-            summary["components"]["isp_modification"] = {"num_pairs": len(entries)}
-            print(f"[pipeline:{env_name}] <<< 02_isp_modification wrote {len(entries)} pairs", flush=True)
-
-        if "relighting" in cfg.components:
-            print(f"[pipeline:{env_name}] >>> 03_relighting", flush=True)
-            try:
-                entries = relighting.generate_pairs(
-                    runtime,
-                    cameras=sphere_cameras,
-                    output_dir=env_dir / "03_relighting",
-                    count=cfg.relighting_pairs_per_env,
-                    relighting_command=cfg.relighting_command,
-                    seed=cfg.seed,
-                )
-                summary["components"]["relighting"] = {"num_pairs": len(entries)}
-                print(f"[pipeline:{env_name}] <<< 03_relighting wrote {len(entries)} pairs", flush=True)
-            except RuntimeError as exc:
-                summary["components"]["relighting"] = {"skipped": str(exc)}
-                print(f"[pipeline:{env_name}] !!! 03_relighting skipped: {exc}", flush=True)
-
-        if "shadow_simulation" in cfg.components:
-            print(f"[pipeline:{env_name}] >>> 04_shadow_simulation", flush=True)
-            entries = shadow_simulation.generate_pairs(
-                runtime,
-                cameras=sphere_cameras,
-                output_dir=env_dir / "04_shadow_simulation",
-                count=cfg.shadow_pairs_per_env,
-                seed=cfg.seed,
-                hdri_roots=cfg.hdri_roots,
-                spp=cfg.spp,
-            )
-            summary["components"]["shadow_simulation"] = {"num_pairs": len(entries)}
-            print(f"[pipeline:{env_name}] <<< 04_shadow_simulation wrote {len(entries)} pairs", flush=True)
 
         if "asset_reinsertion" in cfg.components:
             print(f"[pipeline:{env_name}] >>> 05_asset_reinsertion", flush=True)

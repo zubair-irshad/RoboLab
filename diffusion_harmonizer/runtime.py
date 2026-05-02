@@ -49,7 +49,7 @@ class CameraSpec:
 class HarmonizerRuntime:
     """Live wrapper over a RoboLab env tailored to paired-data generation."""
 
-    def __init__(self, env_name: str, *, device: str = "cuda:0", seed: int = 0, instruction_type: str = "default", env_index: int = 0):
+    def __init__(self, env_name: str, *, device: str = "cuda:0", seed: int = 0, instruction_type: str = "default", env_index: int = 0, num_envs: int = 1):
         # Imports are deferred so this module is importable without Isaac Sim.
         from robolab.core.environments.runtime import create_env, end_episode  # noqa
         import omni.replicator.core as rep
@@ -65,7 +65,7 @@ class HarmonizerRuntime:
             scene=env_name,
             device=device,
             seed=seed,
-            num_envs=1,
+            num_envs=num_envs,
             use_fabric=True,
             instruction_type=instruction_type,
         )
