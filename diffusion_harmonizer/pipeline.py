@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -111,7 +112,12 @@ def run_pipeline(
     try:
         for spec in scene_specs:
             t0 = time.time()
-            scene_summary = _run_scene(renderer, spec, cfg)
+            try:
+                scene_summary = _run_scene(renderer, spec, cfg)
+            except Exception as exc:
+                tb = traceback.format_exc()
+                print(f"[pipeline:{spec.scene_id}] FAILED: {exc}\n{tb}", flush=True)
+                scene_summary = {"scene_id": spec.scene_id, "error": str(exc), "traceback": tb}
             scene_summary["wall_seconds"] = time.time() - t0
             summary["scenes"][spec.scene_id] = scene_summary
             save_json(cfg.output_root / "summary.json", summary)
@@ -140,15 +146,27 @@ def _run_scene(renderer, spec: RoboLabSceneSpec, cfg: PipelineConfig) -> dict[st
     print(f"[pipeline]   foreground_prims: {spec.foreground_prim_paths}", flush=True)
 
     # Fresh stage per scene so prim paths and camera lists don't leak between scenes.
-    renderer.world.clear() if hasattr(renderer.world, "clear") else None
+    print(f"[pipeline:{spec.scene_id}] clearing stage", flush=True)
+    if hasattr(renderer.world, "clear"):
+        try:
+            renderer.world.clear()
+        except Exception as exc:
+            print(f"[pipeline:{spec.scene_id}] world.clear() warning: {exc}", flush=True)
     renderer.cameras.clear()
     renderer.render_products.clear()
     renderer.annotators.clear()
+
+    print(f"[pipeline:{spec.scene_id}] referencing scene + robot + dome HDRI", flush=True)
     reference_scene_into_renderer(renderer, spec)
+    print(f"[pipeline:{spec.scene_id}] stepping simulator (4 steps to settle stage)", flush=True)
     renderer.step(4)
 
     print(f"[pipeline:{spec.scene_id}] saving 4 preview cameras", flush=True)
-    _save_scene_preview(renderer, spec, scene_dir / "preview")
+    try:
+        _save_scene_preview(renderer, spec, scene_dir / "preview")
+    except Exception as exc:
+        print(f"[pipeline:{spec.scene_id}] preview rendering failed: {exc}", flush=True)
+        traceback.print_exc()
 
     foreground_paths = spec.foreground_prim_paths
 
