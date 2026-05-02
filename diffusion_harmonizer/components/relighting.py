@@ -1,25 +1,28 @@
+"""Relighting (DiffusionHarmonizer §3.2).
+
+The paper relights only the foreground crop with a diffusion relighting model
+(DiffusionRenderer [19]) under a randomly sampled lighting prompt, then
+composites the relit crop back over the original frame so global lighting
+becomes inconsistent. We keep the diffusion model behind a sidecar command so
+this repo doesn't pull in conflicting torch / diffusers stacks.
+
+Pass ``relighting_command`` pointing at a script that reads ``--input``, ``--mask``
+and writes ``--output``. If unset, the component is skipped with a clear message.
+"""
+
 from __future__ import annotations
 
-import argparse
-import json
 import random
 import subprocess
 from pathlib import Path
 
 import numpy as np
 
-from diffusion_harmonizer.components.common import discover_demo_cameras, feather_mask, foreground_mask, pair_id
+from diffusion_harmonizer.components.common import feather_mask, foreground_mask, pair_id
 from diffusion_harmonizer.image_io import save_png, write_pair
 
 
 class RelightingModel:
-    """Sidecar adapter for a real relighting diffusion model.
-
-    DiffusionHarmonizer cites DiffusionRenderer [19] for relighting. This
-    adapter keeps Isaac Sim isolated from model dependency conflicts: pass a
-    command that reads a foreground crop and mask and writes a relit crop.
-    """
-
     def __init__(self, command: str | None = None, cache_dir: str | Path = "assets/models/relighting"):
         self.command = command
         self.cache_dir = Path(cache_dir)
@@ -27,10 +30,7 @@ class RelightingModel:
 
     def relight(self, crop: np.ndarray, mask: np.ndarray, prompt: str, work_dir: Path) -> np.ndarray:
         if not self.command:
-            raise RuntimeError(
-                "No relighting diffusion command configured. Use DiffusionRenderer or another real relighting "
-                "model sidecar and pass --relighting_command."
-            )
+            raise RuntimeError("No relighting diffusion command configured. Pass --relighting-command.")
         crop_path = work_dir / "relight_crop.png"
         mask_path = work_dir / "relight_mask.png"
         out_path = work_dir / "relight_output.png"
@@ -39,16 +39,11 @@ class RelightingModel:
         subprocess.run(
             [
                 self.command,
-                "--input",
-                str(crop_path),
-                "--mask",
-                str(mask_path),
-                "--output",
-                str(out_path),
-                "--prompt",
-                prompt,
-                "--cache_dir",
-                str(self.cache_dir),
+                "--input", str(crop_path),
+                "--mask", str(mask_path),
+                "--output", str(out_path),
+                "--prompt", prompt,
+                "--cache_dir", str(self.cache_dir),
             ],
             check=True,
         )
@@ -75,23 +70,22 @@ def _lighting_prompt(rng: random.Random) -> str:
 
 
 def generate_pairs(
-    renderer,
-    output_dir: str | Path = "data/relighting/demo",
-    count: int = 30,
-    foreground_paths: list[str] | None = None,
+    runtime,
+    cameras: list[str],
+    output_dir: str | Path,
+    count: int = 12,
     relighting_command: str | None = None,
     seed: int = 42,
 ) -> dict[str, dict[str, str]]:
     rng = random.Random(seed)
     output = Path(output_dir)
     model = RelightingModel(command=relighting_command)
-    cameras = discover_demo_cameras(renderer, count=min(5, count))
-    foreground_paths = foreground_paths or ["/World/Robot", "/World/Object_"]
+    foreground_paths = runtime.foreground_prim_paths()
     entries: dict[str, dict[str, str]] = {}
 
-    for idx in range(count):
-        camera = cameras[idx % len(cameras)]
-        frame = renderer.capture_frame(camera, rgb=True, segmentation=True)
+    for idx in range(min(count, len(cameras))):
+        camera = cameras[idx]
+        frame = runtime.capture_frame(camera, rgb=True, segmentation=True)
         target = frame["rgb"]
         mask = foreground_mask(frame["segmentation"], frame["segmentation_mapping"] or {}, foreground_paths)
         mask = feather_mask(mask, sigma=3.0)
@@ -102,6 +96,7 @@ def generate_pairs(
         x0, y0, x1, y1 = box
         prompt = _lighting_prompt(rng)
         pair_dir = output / pair_id(idx)
+        pair_dir.mkdir(parents=True, exist_ok=True)
         relit_crop = model.relight(target[y0:y1, x0:x1], mask[y0:y1, x0:x1], prompt, pair_dir)
         relit_full = target.copy()
         relit_full[y0:y1, x0:x1] = relit_crop
@@ -115,24 +110,3 @@ def generate_pairs(
             mask=mask,
         )
     return entries
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--output_dir", default="data/relighting/demo")
-    parser.add_argument("--count", type=int, default=30)
-    parser.add_argument("--relighting_command", default=None)
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-    from diffusion_harmonizer.rendering import launch_renderer
-
-    renderer = launch_renderer(headless=True)
-    try:
-        entries = generate_pairs(renderer, args.output_dir, args.count, relighting_command=args.relighting_command, seed=args.seed)
-        Path(args.output_dir).joinpath("pairs.json").write_text(json.dumps(entries, indent=2))
-    finally:
-        renderer.shutdown()
-
-
-if __name__ == "__main__":
-    main()

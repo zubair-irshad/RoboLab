@@ -1,6 +1,17 @@
+"""ISP Modification (DiffusionHarmonizer §3.2).
+
+For every privileged sphere camera we pull rgb + instance segmentation from
+the live env, draw a random ISP parameter set, re-render the captured rgb
+through a software ISP, and composite back via Eq. (3):
+
+    I_mix = M ⊙ I_ISP + (1 - M) ⊙ I_orig
+
+with ``M`` the foreground mask coming from Replicator's instance-segmentation
+mapping (foreground prim paths come from ``runtime.foreground_prim_paths()``).
+"""
+
 from __future__ import annotations
 
-import argparse
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -8,7 +19,6 @@ from pathlib import Path
 import numpy as np
 
 from diffusion_harmonizer.components.common import (
-    discover_demo_cameras,
     feather_mask,
     foreground_mask_from_visibility_difference,
     foreground_mask_with_fallback,
@@ -87,55 +97,52 @@ def apply_software_isp(image: np.ndarray, params: ISPParams, rng: random.Random 
 
 
 def generate_pairs(
-    renderer,
-    output_dir: str | Path = "data/isp_modification/demo",
+    runtime,
+    cameras: list[str],
+    output_dir: str | Path,
     count: int = 30,
-    foreground_paths: list[str] | None = None,
     seed: int = 42,
-    pre_pair_callback=None,
-    full_frame_fraction: float = 0.0,
+    full_frame_fraction: float = 0.2,
     strength: float = 0.8,
 ) -> dict[str, dict[str, str]]:
     rng = random.Random(seed)
     output = Path(output_dir)
-    cameras = discover_demo_cameras(renderer, count=min(5, count))
+    foreground_paths = runtime.foreground_prim_paths()
     entries: dict[str, dict[str, str]] = {}
-    foreground_paths = foreground_paths or ["/World/Robot", "/World/Object_"]
 
-    for idx in range(count):
-        camera = cameras[idx % len(cameras)]
-        scene_state = pre_pair_callback(idx, camera) if pre_pair_callback else {}
-        frame = renderer.capture_frame(camera, rgb=True, segmentation=True)
+    for idx in range(min(count, len(cameras))):
+        camera = cameras[idx]
+        frame = runtime.capture_frame(camera, rgb=True, segmentation=True)
         target = frame["rgb"]
         use_full_frame = full_frame_fraction > 0.0 and rng.random() < full_frame_fraction
         params = sample_isp_params(rng, scale=0.3 if use_full_frame else strength)
         isp = apply_software_isp(target, params, rng)
+
         if use_full_frame:
             mask = np.ones(target.shape[:2], dtype=np.float32)
-            mode = "full_frame_mild"
             mask_source = "full_frame"
+            mode = "full_frame_mild"
         else:
             mask, mask_source = foreground_mask_with_fallback(
-                frame["segmentation"],
-                frame["segmentation_mapping"] or {},
-                foreground_paths,
+                frame["segmentation"], frame["segmentation_mapping"] or {}, foreground_paths
             )
             if mask_source == "empty_foreground_mask":
-                try:
-                    renderer.set_prims_visibility(list(foreground_paths), False)
-                    receiver = renderer.capture_frame(camera, rgb=True)["rgb"]
-                finally:
-                    renderer.set_prims_visibility(list(foreground_paths), True)
+                runtime.set_prims_visibility(foreground_paths, False)
+                receiver = runtime.capture_frame(camera, rgb=True)["rgb"]
+                runtime.set_prims_visibility(foreground_paths, True)
                 mask = foreground_mask_from_visibility_difference(target, receiver)
                 mask_source = "visibility_difference"
             if float(np.mean(mask > 0.05)) < 0.002:
                 continue
             mask = feather_mask(mask, sigma=3.0)
             mode = "masked_foreground"
+
         mixed = (mask[..., None] * isp.astype(np.float32) + (1.0 - mask[..., None]) * target.astype(np.float32)).astype(np.uint8)
+        pair_dir = output / pair_id(idx)
+        save_png(pair_dir / "isp_full.png", isp)
         key = f"isp_{pair_id(idx)}"
         entries[key] = write_pair(
-            output / pair_id(idx),
+            pair_dir,
             mixed,
             target,
             {
@@ -145,28 +152,8 @@ def generate_pairs(
                 "params": asdict(params),
                 "mask_source": mask_source,
                 "mask_coverage": float(np.mean(mask > 0.05)),
-                "scene_state": scene_state,
+                "foreground_prim_paths": foreground_paths,
             },
             mask=mask,
         )
-        save_png(output / pair_id(idx) / "isp_full.png", isp)
     return entries
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--output_dir", default="data/isp_modification/demo")
-    parser.add_argument("--count", type=int, default=30)
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-    from diffusion_harmonizer.rendering import launch_renderer
-
-    renderer = launch_renderer(headless=True)
-    try:
-        generate_pairs(renderer, args.output_dir, args.count, seed=args.seed)
-    finally:
-        renderer.shutdown()
-
-
-if __name__ == "__main__":
-    main()
