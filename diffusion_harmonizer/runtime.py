@@ -113,15 +113,21 @@ class HarmonizerRuntime:
     # ---- physics / sim stepping --------------------------------------------
 
     def step(self, n: int = 1) -> None:
-        """Advance the env so renderers see the latest stage state."""
+        """Advance the env so renderers see the latest stage state.
 
-        import torch
+        Uses ``isaaclab.envs.utils.spaces.sample_space`` to draw an action from
+        the env's action space — matching ``examples/demo/run_empty.py``.
+        Sending zero-actions tends to command the Franka into self-collision
+        which crashes GPU PhysX on memory-constrained GPUs.
+        """
 
         if n <= 0:
             return
-        zero_action = torch.zeros((self.env.num_envs, *self.env.single_action_space.shape), device=self.env.device)
+        from isaaclab.envs.utils.spaces import sample_space
+
         for _ in range(n):
-            self.env.step(zero_action)
+            actions = sample_space(self.env.single_action_space, device=self.env.device, batch_size=self.env.num_envs)
+            self.env.step(actions)
 
     # ---- camera management on the live stage --------------------------------
 
@@ -220,6 +226,15 @@ class HarmonizerRuntime:
             annotators[modality] = annotator
         self.render_products[name] = render_product
         self.annotators[name] = annotators
+        # Replicator products need at least one app update to wire up before
+        # capture_frame can pull data without stalling indefinitely.
+        try:
+            from isaacsim import SimulationApp  # noqa: F401
+            import omni.kit.app
+
+            omni.kit.app.get_app().update()
+        except Exception:
+            pass
         self.cameras[name] = CameraSpec(
             name=name,
             prim_path=prim_path,

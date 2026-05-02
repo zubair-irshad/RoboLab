@@ -54,7 +54,7 @@ class PipelineConfig:
     reinsertion_pairs_per_env: int = 12
     relighting_command: str | None = None
     seed: int = 42
-    settle_steps: int = 4
+    settle_steps: int = 0  # 0 = skip stepping; env.reset() inside HarmonizerRuntime is enough
     components: tuple[str, ...] = (
         "artifacts_correction",
         "isp_modification",
@@ -113,7 +113,9 @@ def _run_env(env_name: str, cfg: PipelineConfig) -> dict[str, Any]:
     print(f"[pipeline:{env_name}] foreground_prim_paths: {summary['foreground_prim_paths']}", flush=True)
 
     try:
-        runtime.step(cfg.settle_steps)
+        if cfg.settle_steps > 0:
+            print(f"[pipeline:{env_name}] stepping {cfg.settle_steps} settle steps", flush=True)
+            runtime.step(cfg.settle_steps)
         _save_preview(runtime, env_dir / "preview", cfg.preview_cameras)
 
         sphere_cameras = runtime.add_sphere_cameras(

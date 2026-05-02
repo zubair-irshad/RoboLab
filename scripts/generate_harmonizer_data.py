@@ -58,7 +58,8 @@ parser.add_argument("--reinsertion-pairs", type=int, default=12)
 parser.add_argument("--relighting-command", default=None,
                     help="Sidecar command for the relighting diffusion model. Skip the component if omitted.")
 parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--settle-steps", type=int, default=4)
+parser.add_argument("--settle-steps", type=int, default=0,
+                    help="Number of env.step() calls before capture. 0 (default) is enough — env.reset() already settles.")
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, _ = parser.parse_known_args()
