@@ -6,6 +6,6 @@ training data on disk. Each builder is independent and can be run / re-run
 without touching the live simulator.
 """
 
-from . import isp, shadow
+from . import artifacts, isp, shadow
 
-__all__ = ["isp", "shadow"]
+__all__ = ["artifacts", "isp", "shadow"]

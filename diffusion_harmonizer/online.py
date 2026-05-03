@@ -70,7 +70,7 @@ class OnlineConfig:
     device: str = "cuda:0"
     num_envs: int = 1
     physx_buffer_scale: float = 0.1
-    components: tuple[str, ...] = ("isp_modification", "shadow_simulation")
+    components: tuple[str, ...] = ("isp_modification", "shadow_simulation", "asset_reinsertion")
     isp_full_frame_fraction: float = 0.0
     # Linear-pipeline ISP. 0.5 -> half-amplitude around identity for every
     # knob (exposure, gains, CCM noise, gamma, contrast, brightness, sat).
@@ -78,10 +78,24 @@ class OnlineConfig:
     # "different camera ISP" look.
     isp_strength: float = 0.5
     shadow_min_coverage: float = 0.0008
-    # Per-episode randomized sun for visible cast shadows. Smaller angular size
+    # Per-CAPTURE randomized sun for visible cast shadows. Smaller angular size
     # = sharper shadow edges; higher intensity = stronger contrast vs the dome.
     sun_intensity_range: tuple[float, float] = (3000.0, 8000.0)
     sun_angle_deg_range: tuple[float, float] = (0.5, 3.0)
+    # Per-CAPTURE dome rotation. The paper "randomly varies environment maps"
+    # for shadow simulation; rotating the existing HDRI is a cheap way to
+    # change overall illumination direction without swapping textures.
+    randomize_dome_rotation: bool = True
+    # Cameras used by asset re-insertion (paper-faithful: external + wrist).
+    reinsertion_cameras: tuple[str, ...] = ("external_cam", "over_shoulder_left_camera", "wrist_cam")
+    # Optional hemispheric multi-view snapshot for offline gsplat artifacts
+    # training. 0 = skip; ~30-60 is a reasonable starter for DIFIX3D+ strategies.
+    hemisphere_cameras: int = 0
+    hemisphere_radius: float = 1.6
+    hemisphere_center: tuple[float, float, float] = (0.4, 0.0, 0.4)
+    hemisphere_resolution: tuple[int, int] = (512, 512)
+    hemisphere_spp: int = 16
+    hemisphere_settle_steps: int = 5
     # Force path tracing during capture so the rasterizer's shadowLink
     # limitations don't make shadow toggles invisible.
     use_path_tracing: bool = True
@@ -121,6 +135,7 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
     env_dir = cfg.output_root / env_name
     isp_dir = env_dir / "02_isp_modification"
     shadow_dir = env_dir / "04_shadow_simulation"
+    reinsert_dir = env_dir / "05_asset_reinsertion"
 
     print(f"\n[online] === env {env_name} ===", flush=True)
     runtime = HarmonizerRuntime(
@@ -170,16 +185,17 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
         rng = random.Random(cfg.seed)
         isp_count = 0
         shadow_count = 0
+        reinsertion_count = 0
+
+        # One-shot hemispheric multi-view snapshot for the offline gsplat
+        # artifacts builder. Done before the trajectory loop starts so the
+        # scene is in its reset pose with the robot at default config.
+        if "artifacts_correction" in cfg.components and cfg.hemisphere_cameras > 0:
+            _hemispheric_snapshot(runtime, env, env_dir / "01_artifacts_correction", cfg, env_name)
 
         for episode in range(cfg.num_episodes):
-            # Per-episode randomized distant sun → diverse cast shadows.
-            sun_dir = _random_sun_direction(rng)
-            sun_intensity = rng.uniform(*cfg.sun_intensity_range)
-            sun_angle_deg = rng.uniform(*cfg.sun_angle_deg_range)
-            runtime.set_distant_light(intensity=sun_intensity, angle_deg=sun_angle_deg, direction=sun_dir)
             print(
-                f"[online:{env_name}] episode {episode + 1}/{cfg.num_episodes}  "
-                f"sun_dir={tuple(round(c, 2) for c in sun_dir)} intensity={sun_intensity:.0f} angle={sun_angle_deg:.1f}",
+                f"[online:{env_name}] episode {episode + 1}/{cfg.num_episodes}",
                 flush=True,
             )
 
@@ -264,42 +280,85 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
                         ):
                             isp_count += 1
 
-                # Switch to PT for the shadow pair: TiledCamera rasterization
-                # honours UsdLux.shadowLink poorly. PT respects it precisely.
-                if "shadow_simulation" in cfg.components and full_foreground:
-                    if cfg.use_path_tracing:
-                        runtime.set_path_tracing(True, spp=cfg.spp)
+                # PT block: shadow + asset re-insertion both consume PT renders
+                # under matched lighting. Fresh sun direction + dome rotation
+                # per capture (paper §3.2 randomizes light direction/softness).
+                want_shadow = "shadow_simulation" in cfg.components and full_foreground
+                want_reinsert = "asset_reinsertion" in cfg.components and objects_only
+                if (want_shadow or want_reinsert) and cfg.use_path_tracing:
+                    sun_dir = _random_sun_direction(rng)
+                    sun_intensity = rng.uniform(*cfg.sun_intensity_range)
+                    sun_angle = rng.uniform(*cfg.sun_angle_deg_range)
+                    runtime.set_distant_light(
+                        intensity=sun_intensity, angle_deg=sun_angle, direction=sun_dir,
+                    )
+                    if cfg.randomize_dome_rotation:
+                        runtime.set_dome_hdri(None, rotation_deg=rng.uniform(0.0, 360.0))
+                    runtime.set_path_tracing(True, spp=cfg.spp)
+                    _kit_update()
+
+                    obs_t, _, _, _, _ = env.step(held_actions)  # target_pt: full PBR
+
+                    obs_ns = None
+                    if want_shadow:
+                        runtime.set_shadow_link_excludes(full_foreground, enabled=True)
                         _kit_update()
-                    obs_t, _, _, _, _ = env.step(held_actions)
-                    runtime.set_shadow_link_excludes(full_foreground, enabled=True)
-                    _kit_update()
-                    obs_ns, _, _, _, _ = env.step(held_actions)
-                    runtime.set_shadow_link_excludes(full_foreground, enabled=False)
-                    _kit_update()
-                    if cfg.use_path_tracing:
-                        runtime.set_path_tracing(False)
+                        obs_ns, _, _, _, _ = env.step(held_actions)
+                        runtime.set_shadow_link_excludes(full_foreground, enabled=False)
+                        _kit_update()
+
+                    obs_bg_pt = None
+                    if want_reinsert:
+                        runtime.set_prims_visibility(objects_only, False)
+                        _kit_update()
+                        obs_bg_pt, _, _, _, _ = env.step(held_actions)
+                        runtime.set_prims_visibility(objects_only, True)
+                        _kit_update()
+
+                    runtime.set_path_tracing(False)
+
                     for camera_name in cameras:
                         target_pt = _unpack_rgb(obs_t, camera_name)
-                        no_shadow = _unpack_rgb(obs_ns, camera_name)
-                        if target_pt is None or no_shadow is None:
+                        if target_pt is None:
                             continue
+                        mask = object_masks.get(
+                            camera_name, np.zeros(target_pt.shape[:2], dtype=np.float32)
+                        )
                         tag = f"e{episode:02d}_s{step:03d}_{camera_name}"
-                        if _build_shadow_pair(
-                            target_pt, no_shadow,
-                            object_masks.get(camera_name, np.zeros(target_pt.shape[:2], dtype=np.float32)),
-                            shadow_dir / tag, cfg, camera_name,
-                        ):
-                            shadow_count += 1
 
-        print(f"[online:{env_name}] DONE — isp={isp_count} shadow={shadow_count}", flush=True)
+                        if want_shadow and obs_ns is not None:
+                            no_shadow = _unpack_rgb(obs_ns, camera_name)
+                            if no_shadow is not None and _build_shadow_pair(
+                                target_pt, no_shadow, mask, shadow_dir / tag, cfg, camera_name,
+                            ):
+                                shadow_count += 1
+
+                        if (
+                            want_reinsert
+                            and obs_bg_pt is not None
+                            and camera_name in cfg.reinsertion_cameras
+                        ):
+                            bg_pt = _unpack_rgb(obs_bg_pt, camera_name)
+                            if bg_pt is not None and _build_reinsertion_pair(
+                                target_pt, bg_pt, mask, reinsert_dir / tag, cfg, camera_name,
+                            ):
+                                reinsertion_count += 1
+
+        print(
+            f"[online:{env_name}] DONE — isp={isp_count} shadow={shadow_count} "
+            f"reinsertion={reinsertion_count}",
+            flush=True,
+        )
         return {
             "env_name": env_name,
             "isp_pairs": isp_count,
             "shadow_pairs": shadow_count,
+            "reinsertion_pairs": reinsertion_count,
             "episodes": cfg.num_episodes,
             "steps_per_episode": cfg.num_steps_per_episode,
             "captures_per_episode": cfg.captures_per_episode,
             "cameras": cameras,
+            "reinsertion_cameras": list(cfg.reinsertion_cameras),
             "object_prim_paths": objects_only,
             "foreground_prim_paths": full_foreground,
         }
@@ -380,6 +439,113 @@ def _build_isp_pair(target: np.ndarray, mask: np.ndarray, pair_dir: Path, rng: r
         mask=m,
     )
     return True
+
+
+def _build_reinsertion_pair(target_pt: np.ndarray, bg_pt: np.ndarray, fg_mask: np.ndarray, pair_dir: Path, cfg: OnlineConfig, camera_name: str) -> bool:
+    """Asset re-insertion (DiffusionHarmonizer §3.2).
+
+    Composite ``bg_pt`` (foreground hidden, no object cast shadows) with the
+    foreground pixels lifted from ``target_pt`` (full PBR). Object pixels:
+    same as the real render. Receiver pixels: bg-only render with no object
+    cast shadows on the table — the "synthetically inserted" look the paper
+    flags as missing harmonization. Pair this with the full PBR target so
+    the model learns to add the missing shadow + harmonization.
+    """
+
+    if float(np.mean(fg_mask > 0.05)) < 0.002:
+        return False
+    m = fg_mask[..., None]
+    composite = (m * target_pt.astype(np.float32) + (1.0 - m) * bg_pt.astype(np.float32)).astype(np.uint8)
+    save_png(pair_dir / "bg_render.png", bg_pt)
+    write_pair(
+        pair_dir, composite, target_pt,
+        {
+            "component": "asset_reinsertion",
+            "camera": camera_name,
+            "mask_coverage": float(np.mean(fg_mask > 0.05)),
+            "note": "input = mask*target_pt + (1-mask)*bg_pt; target = full PBR with shadows.",
+        },
+        mask=fg_mask,
+    )
+    return True
+
+
+def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: OnlineConfig, env_name: str) -> None:
+    """One-shot multi-view rgb+depth+camera matrix dump for offline gsplat.
+
+    The DIFIX3D+ artifacts-correction strategies (sparse_k / underfit / cycle
+    / cross_ref) need rgb + intrinsics + extrinsics across N hemispheric
+    views of a static scene. We do that here once per env, before the
+    trajectory loop touches anything, and write to disk:
+
+      ``<output_dir>/views/<NNNN>/{rgb.png, depth.npy, intrinsics.json,
+      extrinsics.json}``
+
+    The post-hoc ``scripts/build_artifacts_pairs.py`` reads these views and
+    runs the gsplat strategies; no Isaac Sim needed there.
+    """
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    views_dir = output_dir / "views"
+    views_dir.mkdir(parents=True, exist_ok=True)
+
+    print(
+        f"[online:{env_name}] hemispheric snapshot: {cfg.hemisphere_cameras} cameras "
+        f"radius={cfg.hemisphere_radius} spp={cfg.hemisphere_spp}",
+        flush=True,
+    )
+
+    # Settle the env so default joint positions & object resting state are stable.
+    if cfg.hemisphere_settle_steps > 0:
+        runtime.step(cfg.hemisphere_settle_steps)
+
+    cameras = runtime.add_sphere_cameras(
+        center=cfg.hemisphere_center,
+        radius=cfg.hemisphere_radius,
+        num_cameras=cfg.hemisphere_cameras,
+        resolution=cfg.hemisphere_resolution,
+        name_prefix=f"hemi_{env_name}",
+    )
+    runtime.set_path_tracing(True, spp=cfg.hemisphere_spp)
+    _kit_update()
+
+    manifest_views = []
+    import time as _time
+
+    t0 = _time.time()
+    for idx, cam in enumerate(cameras):
+        frame = runtime.capture_frame(cam, rgb=True, depth=True)
+        view_dir = views_dir / f"{idx:04d}"
+        view_dir.mkdir(parents=True, exist_ok=True)
+        save_png(view_dir / "rgb.png", frame["rgb"])
+        if frame.get("depth") is not None:
+            np.save(view_dir / "depth.npy", frame["depth"])
+        save_json(view_dir / "intrinsics.json", {"K": frame["camera_intrinsics"].tolist()})
+        save_json(view_dir / "extrinsics.json", {"world_T_cam_gl": frame["camera_extrinsics"].tolist()})
+        manifest_views.append({"view_id": idx, "dir": str(view_dir.relative_to(output_dir))})
+        if (idx + 1) % 10 == 0:
+            elapsed = _time.time() - t0
+            rate = (idx + 1) / max(elapsed, 1e-3)
+            print(
+                f"[online:{env_name}]   hemi {idx + 1}/{len(cameras)} ({rate:.2f} fps)",
+                flush=True,
+            )
+
+    save_json(
+        output_dir / "manifest.json",
+        {
+            "env_name": env_name,
+            "num_views": len(cameras),
+            "resolution": list(cfg.hemisphere_resolution),
+            "spp": cfg.hemisphere_spp,
+            "views": manifest_views,
+        },
+    )
+    runtime.set_path_tracing(False)
+    print(
+        f"[online:{env_name}] hemispheric snapshot done in {_time.time() - t0:.1f}s",
+        flush=True,
+    )
 
 
 def _build_shadow_pair(target: np.ndarray, no_shadow: np.ndarray | None, fg_mask: np.ndarray, pair_dir: Path, cfg: OnlineConfig, camera_name: str) -> bool:
