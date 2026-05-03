@@ -1,174 +1,111 @@
 """ISP Modification (DiffusionHarmonizer §3.2).
 
-For every privileged sphere camera we pull rgb + instance segmentation from
-the live env, draw a random ISP parameter set, re-render the captured rgb
-through a software ISP, and composite back via Eq. (3):
+Realistic software ISP simulation operating in linear-light space:
 
-    I_mix = M ⊙ I_ISP + (1 - M) ⊙ I_orig
+  1. inverse-gamma to linear
+  2. exposure (EV)
+  3. per-channel white-balance gains (R/B wider than G — matches sensor IQ)
+  4. near-identity 3x3 color correction matrix (the subtle hue drift different
+     manufacturers' ISPs produce — captures "different camera" mismatch
+     without flipping color identity the way an HSV hue-shift can)
+  5. forward gamma / tone curve
+  6. contrast + brightness
+  7. saturation around luminance
 
-with ``M`` the foreground mask coming from Replicator's instance-segmentation
-mapping (foreground prim paths come from ``runtime.foreground_prim_paths()``).
+Eq. (3) composite is then ``M ⊙ I_ISP + (1−M) ⊙ I_orig`` with ``M`` covering
+manipulable foreground objects only (``runtime.object_prim_paths()``).
 """
 
 from __future__ import annotations
 
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-
-from diffusion_harmonizer.components.common import (
-    feather_mask,
-    foreground_mask_from_visibility_difference,
-    foreground_mask_with_fallback,
-    pair_id,
-)
-from diffusion_harmonizer.image_io import save_png, write_pair
 
 
 @dataclass
 class ISPParams:
     exposure_ev: float
-    white_balance_K: int
+    wb_gain_r: float
+    wb_gain_g: float
+    wb_gain_b: float
+    ccm: list[list[float]]  # 3x3 list-of-lists for clean JSON serialization
     gamma: float
-    saturation: float
     contrast: float
-    hue_shift: float
-    noise_sigma: float
-
-
-def srgb_to_linear(image: np.ndarray) -> np.ndarray:
-    x = image.astype(np.float32) / 255.0
-    return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
-
-
-def linear_to_srgb(image: np.ndarray) -> np.ndarray:
-    x = np.clip(image, 0.0, 1.0)
-    srgb = np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1.0 / 2.4) - 0.055)
-    return (np.clip(srgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+    brightness: float
+    saturation: float
 
 
 def sample_isp_params(rng: random.Random, scale: float = 1.0) -> ISPParams:
-    """All knobs modulated by ``scale``, including white balance.
+    """Sample ISP params modulated uniformly by ``scale``.
 
-    The previous version always sampled WB from the full 3000-8000 K span
-    even at low ``scale``, which alone flipped object color identity (a teal
-    bowl rendered as red). We anchor at D65 (~5500 K) and let ``scale`` drive
-    the half-width of the WB sweep, so ``scale=0.3`` gives ±750 K — paper-
-    like subtle warm/cool drift rather than a full white-balance reversal.
+    Ranges at scale=1.0 follow the realistic-ISP recipe — RGB gains span the
+    same ranges real cameras vary across (R: 0.85-1.20, G: 0.95-1.05,
+    B: 0.80-1.25), CCM is identity + N(0, 0.035) gaussian noise, and the
+    tone curve / contrast / saturation knobs match the user-provided values.
+    Lower ``scale`` shrinks every range linearly toward identity.
     """
 
-    wb_center = 5500
-    wb_halfwidth = int(2500 * scale)
+    def around(low: float, high: float) -> float:
+        center = 0.5 * (low + high)
+        half = 0.5 * (high - low)
+        return center + (rng.uniform(-half, half) * scale)
+
+    ccm = [
+        [1.0 + rng.gauss(0.0, 0.035) * scale if i == j else rng.gauss(0.0, 0.035) * scale for j in range(3)]
+        for i in range(3)
+    ]
     return ISPParams(
-        exposure_ev=rng.uniform(-1.5, 1.5) * scale,
-        white_balance_K=int(wb_center + rng.uniform(-wb_halfwidth, wb_halfwidth)),
-        gamma=1.0 + (rng.uniform(0.6, 1.8) - 1.0) * scale,
-        saturation=1.0 + (rng.uniform(0.5, 1.5) - 1.0) * scale,
-        contrast=1.0 + (rng.uniform(0.7, 1.3) - 1.0) * scale,
-        hue_shift=rng.uniform(-15.0, 15.0) * scale,
-        noise_sigma=rng.uniform(0.0, 10.0) * scale,
+        exposure_ev=rng.uniform(-0.6, 0.6) * scale,
+        wb_gain_r=around(0.85, 1.20),
+        wb_gain_g=around(0.95, 1.05),
+        wb_gain_b=around(0.80, 1.25),
+        ccm=ccm,
+        gamma=around(0.8, 1.3),
+        contrast=around(0.85, 1.2),
+        brightness=rng.uniform(-0.04, 0.04) * scale,
+        saturation=around(0.8, 1.25),
     )
 
 
-def _kelvin_rgb(kelvin: int) -> np.ndarray:
-    t = kelvin / 100.0
-    if t <= 66:
-        red = 255.0
-        green = 99.4708025861 * np.log(t) - 161.1195681661
-        blue = 0.0 if t <= 19 else 138.5177312231 * np.log(t - 10) - 305.0447927307
-    else:
-        red = 329.698727446 * ((t - 60) ** -0.1332047592)
-        green = 288.1221695283 * ((t - 60) ** -0.0755148492)
-        blue = 255.0
-    return np.clip([red, green, blue], 1.0, 255.0).astype(np.float32) / 255.0
-
-
 def apply_software_isp(image: np.ndarray, params: ISPParams, rng: random.Random | None = None) -> np.ndarray:
-    import cv2
+    """Realistic linear-light software-ISP. ``image`` is sRGB uint8 (H, W, 3)."""
 
-    rng = rng or random.Random()
-    lin = srgb_to_linear(image)
-    lin *= 2.0 ** params.exposure_ev
-    wb = _kelvin_rgb(params.white_balance_K)
-    lin *= wb / max(float(np.mean(wb)), 1e-6)
-    srgb = linear_to_srgb(lin).astype(np.float32) / 255.0
+    del rng  # unused — sampling happens upstream in ``sample_isp_params``
+    rgb = image.astype(np.float32) / 255.0
+    x = np.clip(rgb, 0.0, 1.0) ** 2.2  # inverse-gamma to linear
 
-    # OpenCV's float HSV uses H in [0, 360), not the uint8 [0, 180) convention.
-    # The previous code wrapped with % 180.0, which silently rotated every
-    # pixel with original hue >= 180 (cyans / blues / magentas) by 180°
-    # to its complementary color — independent of the hue_shift value.
-    hsv = cv2.cvtColor(srgb, cv2.COLOR_RGB2HSV)
-    hsv[..., 0] = (hsv[..., 0] + params.hue_shift) % 360.0
-    hsv[..., 1] = np.clip(hsv[..., 1] * params.saturation, 0.0, 1.0)
-    srgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-    srgb = np.clip((srgb - 0.5) * params.contrast + 0.5, 0.0, 1.0)
-    srgb = np.clip(np.power(np.clip(srgb, 0.0, 1.0), 1.0 / max(params.gamma, 1e-3)), 0.0, 1.0)
-    if params.noise_sigma > 0:
-        noise = np.asarray([rng.gauss(0.0, params.noise_sigma / 255.0) for _ in range(srgb.size)], dtype=np.float32)
-        srgb = np.clip(srgb + noise.reshape(srgb.shape), 0.0, 1.0)
-    return (srgb * 255.0).astype(np.uint8)
+    # Exposure (EV stops).
+    x = x * (2.0 ** float(params.exposure_ev))
 
+    # Per-channel white balance gains.
+    gains = np.array(
+        [params.wb_gain_r, params.wb_gain_g, params.wb_gain_b], dtype=np.float32
+    )
+    x = x * gains[None, None, :]
 
-def generate_pairs(
-    runtime,
-    cameras: list[str],
-    output_dir: str | Path,
-    count: int = 30,
-    seed: int = 42,
-    full_frame_fraction: float = 0.2,
-    strength: float = 0.8,
-) -> dict[str, dict[str, str]]:
-    rng = random.Random(seed)
-    output = Path(output_dir)
-    foreground_paths = runtime.foreground_prim_paths()
-    entries: dict[str, dict[str, str]] = {}
+    # Near-identity 3x3 color correction matrix.
+    ccm = np.asarray(params.ccm, dtype=np.float32)
+    x = x.reshape(-1, 3) @ ccm.T
+    x = x.reshape(image.shape).astype(np.float32)
 
-    for idx in range(min(count, len(cameras))):
-        camera = cameras[idx]
-        frame = runtime.capture_frame(camera, rgb=True, segmentation=True)
-        target = frame["rgb"]
-        use_full_frame = full_frame_fraction > 0.0 and rng.random() < full_frame_fraction
-        params = sample_isp_params(rng, scale=0.3 if use_full_frame else strength)
-        isp = apply_software_isp(target, params, rng)
+    # Clip before display transform.
+    x = np.clip(x, 0.0, 1.0)
 
-        if use_full_frame:
-            mask = np.ones(target.shape[:2], dtype=np.float32)
-            mask_source = "full_frame"
-            mode = "full_frame_mild"
-        else:
-            mask, mask_source = foreground_mask_with_fallback(
-                frame["segmentation"], frame["segmentation_mapping"] or {}, foreground_paths
-            )
-            if mask_source == "empty_foreground_mask":
-                runtime.set_prims_visibility(foreground_paths, False)
-                receiver = runtime.capture_frame(camera, rgb=True)["rgb"]
-                runtime.set_prims_visibility(foreground_paths, True)
-                mask = foreground_mask_from_visibility_difference(target, receiver)
-                mask_source = "visibility_difference"
-            if float(np.mean(mask > 0.05)) < 0.002:
-                continue
-            mask = feather_mask(mask, sigma=3.0)
-            mode = "masked_foreground"
+    # Tone / gamma.
+    x = x ** (1.0 / max(float(params.gamma), 1e-3))
 
-        mixed = (mask[..., None] * isp.astype(np.float32) + (1.0 - mask[..., None]) * target.astype(np.float32)).astype(np.uint8)
-        pair_dir = output / pair_id(idx)
-        save_png(pair_dir / "isp_full.png", isp)
-        key = f"isp_{pair_id(idx)}"
-        entries[key] = write_pair(
-            pair_dir,
-            mixed,
-            target,
-            {
-                "component": "isp_modification",
-                "mode": mode,
-                "camera": camera,
-                "params": asdict(params),
-                "mask_source": mask_source,
-                "mask_coverage": float(np.mean(mask > 0.05)),
-                "foreground_prim_paths": foreground_paths,
-            },
-            mask=mask,
-        )
-    return entries
+    # Contrast + brightness.
+    x = (x - 0.5) * float(params.contrast) + 0.5 + float(params.brightness)
+
+    # Saturation around BT.709 luminance.
+    gray = (
+        0.2126 * x[..., 0:1]
+        + 0.7152 * x[..., 1:2]
+        + 0.0722 * x[..., 2:3]
+    )
+    x = gray + float(params.saturation) * (x - gray)
+
+    return (np.clip(x, 0.0, 1.0) * 255.0).astype(np.uint8)

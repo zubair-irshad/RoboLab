@@ -140,9 +140,17 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
         # TiledCamera rasterization barely respects USD shadowLink. Path
         # tracing does. Switch the renderer once at startup so every env.step
         # below produces a path-traced frame.
+        # Stay rasterized for trajectory steps (fast); switch to path tracing
+        # only inside each capture's three-step block (slow but correct
+        # shadowLink behaviour).
         if cfg.use_path_tracing:
-            runtime.set_path_tracing(True, spp=cfg.spp)
-            print(f"[online:{env_name}] path tracing ENABLED (spp={cfg.spp})", flush=True)
+            runtime.set_path_tracing(False)
+            print(
+                f"[online:{env_name}] path tracing toggled per-capture only (spp={cfg.spp})",
+                flush=True,
+            )
+        else:
+            print(f"[online:{env_name}] rasterization throughout (--no-path-tracing)", flush=True)
 
         playback_actions = _load_playback_actions(env_name, cfg.playback_data_root, cfg.num_episodes)
         if playback_actions:
@@ -185,6 +193,7 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
             capture_steps = _capture_steps(num_steps, cfg.captures_per_episode)
 
             held_actions = None
+            pt_active = False
             for step in range(num_steps):
                 if episode_actions is not None:
                     actions_np = episode_actions[step]
@@ -198,9 +207,20 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
                         held_actions = sample_space(
                             env.single_action_space, device=env.device, batch_size=env.num_envs
                         )
+
+                will_capture = step in capture_steps
+                if cfg.use_path_tracing:
+                    if will_capture and not pt_active:
+                        runtime.set_path_tracing(True, spp=cfg.spp)
+                        _kit_update()
+                        pt_active = True
+                    elif not will_capture and pt_active:
+                        runtime.set_path_tracing(False)
+                        pt_active = False
+
                 obs, _, _, _, _ = env.step(held_actions)
 
-                if step not in capture_steps:
+                if not will_capture:
                     continue
 
                 joint_pos = env.scene["robot"].data.joint_pos[0].detach().cpu().numpy()
@@ -376,32 +396,54 @@ def _shadow_delta(target: np.ndarray, no_shadow: np.ndarray, fg_dilated: np.ndar
 
 
 def _load_playback_actions(env_name: str, root: Path | None, num_episodes: int) -> list[np.ndarray]:
-    """Load up to ``num_episodes`` HDF5 demo trajectories for ``env_name``.
+    """Load up to ``num_episodes`` HDF5 demo trajectories.
 
-    Looks under ``<root>/<env_name>/data.hdf5`` (matches the layout
-    ``examples/demo/run_recorded.py`` consumes). Returns a list of
-    ``(num_steps, action_dim)`` numpy arrays; empty list if no demos.
+    Tries ``<root>/<env_name>/data.hdf5`` first. If the requested env has no
+    recorded demos, falls back to the first sibling task that does — the
+    Droid action space is identical across tasks, so a borrowed trajectory
+    still gives feasible robot motion (it just won't be task-specific).
     """
 
     if root is None:
         return []
-    hdf5_path = Path(root) / env_name / "data.hdf5"
-    if not hdf5_path.exists():
+    root = Path(root)
+    if not root.exists():
         return []
     try:
         from robolab.core.utils.file_utils import load_hdf5_episode_data
     except Exception:
         return []
-    actions: list[np.ndarray] = []
-    for episode in range(num_episodes):
-        try:
-            arr = load_hdf5_episode_data(str(hdf5_path), episode, "actions")
-        except Exception:
-            break
-        if arr is None or len(arr) == 0:
-            break
-        actions.append(np.asarray(arr))
-    return actions
+
+    candidates: list[Path] = []
+    own = root / env_name / "data.hdf5"
+    if own.exists():
+        candidates.append(own)
+    for sibling in sorted(root.iterdir()):
+        sibling_path = sibling / "data.hdf5"
+        if sibling.name == env_name or not sibling_path.exists():
+            continue
+        candidates.append(sibling_path)
+
+    for hdf5_path in candidates:
+        actions: list[np.ndarray] = []
+        for episode in range(num_episodes):
+            try:
+                arr = load_hdf5_episode_data(str(hdf5_path), episode, "actions")
+            except Exception:
+                break
+            if arr is None or len(arr) == 0:
+                break
+            actions.append(np.asarray(arr))
+        if actions:
+            if hdf5_path.parent.name != env_name:
+                print(
+                    f"[playback] {env_name} has no recorded demos; borrowing "
+                    f"{hdf5_path.parent.name} ({len(actions)} episodes) — "
+                    f"action space is identical across Droid tasks.",
+                    flush=True,
+                )
+            return actions
+    return []
 
 
 def _kit_update() -> None:
