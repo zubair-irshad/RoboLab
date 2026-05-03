@@ -32,16 +32,13 @@ parser.add_argument("--tag", nargs="*", default=None)
 parser.add_argument("--limit", type=int, default=None)
 parser.add_argument("--output-root", default="data/diffusion_harmonizer")
 parser.add_argument("--components", nargs="+",
-                    default=["isp_modification", "shadow_simulation", "asset_reinsertion"],
-                    choices=("isp_modification", "shadow_simulation", "asset_reinsertion", "artifacts_correction"))
-parser.add_argument("--reinsertion-cameras", nargs="+",
-                    default=("external_cam", "over_shoulder_left_camera", "wrist_cam"),
-                    help="Cameras used for asset re-insertion (paper uses one external + one wrist).")
+                    default=["isp_modification", "shadow_simulation", "artifacts_correction"],
+                    choices=("isp_modification", "shadow_simulation", "artifacts_correction"))
 parser.add_argument("--no-randomize-dome", dest="randomize_dome_rotation", action="store_false", default=True,
                     help="Skip per-capture dome rotation. Lighting still varies via random sun direction.")
-parser.add_argument("--hemisphere-cameras", type=int, default=0,
+parser.add_argument("--hemisphere-cameras", type=int, default=30,
                     help="Number of hemispheric views to snapshot once per env for the offline gsplat "
-                         "artifacts-correction builder. 0 = skip (default). 30-60 is a reasonable starter.")
+                         "artifacts-correction builder. Pass 0 to skip the snapshot.")
 parser.add_argument("--hemisphere-radius", type=float, default=1.6)
 parser.add_argument("--hemisphere-center", type=float, nargs=3, default=(0.4, 0.0, 0.4))
 parser.add_argument("--hemisphere-resolution", type=int, nargs=2, default=(512, 512))
@@ -133,7 +130,6 @@ def main() -> None:
         use_path_tracing=args_cli.use_path_tracing,
         spp=args_cli.spp,
         playback_data_root=None if args_cli.playback_disabled else Path(args_cli.playback_data_root),
-        reinsertion_cameras=tuple(args_cli.reinsertion_cameras),
         randomize_dome_rotation=args_cli.randomize_dome_rotation,
         hemisphere_cameras=args_cli.hemisphere_cameras,
         hemisphere_radius=args_cli.hemisphere_radius,
@@ -146,9 +142,8 @@ def main() -> None:
     summary = run_online(env_names, cfg)
     total_isp = sum(env.get("isp_pairs", 0) for env in summary["envs"].values())
     total_shadow = sum(env.get("shadow_pairs", 0) for env in summary["envs"].values())
-    total_reinsert = sum(env.get("reinsertion_pairs", 0) for env in summary["envs"].values())
     print(f"[online] wrote summary {cfg.output_root / 'summary.json'} "
-          f"(isp={total_isp}, shadow={total_shadow}, reinsert={total_reinsert})")
+          f"(isp={total_isp}, shadow={total_shadow})")
 
 
 if __name__ == "__main__":
