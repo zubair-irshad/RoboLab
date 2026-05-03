@@ -50,9 +50,16 @@ def foreground_mask_with_fallback(
 def foreground_mask_from_visibility_difference(
     target_rgb: np.ndarray,
     receiver_rgb: np.ndarray,
-    threshold: float = 0.10,
+    threshold: float = 0.15,
 ) -> np.ndarray:
-    """Pixel-difference fallback when instance segmentation has no useful labels."""
+    """Pixel-difference fallback when instance segmentation has no useful labels.
+
+    Both inputs MUST be deterministic renders (rasterization, not path tracing).
+    Path-traced renders have stochastic noise that the diff threshold catches
+    everywhere, producing a near-full mask. We open-then-close the mask so
+    isolated noise pixels die, internal object holes get filled, and the mask
+    stays tight around the actual object silhouette.
+    """
 
     import cv2
 
@@ -61,8 +68,9 @@ def foreground_mask_from_visibility_difference(
     diff = np.max(np.abs(target - receiver), axis=-1)
     mask = (diff > threshold).astype(np.uint8)
     kernel = np.ones((5, 5), dtype=np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-    mask = cv2.dilate(mask, kernel, iterations=1)
+    # Open removes stray noise pixels; close then fills internal holes.
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     return mask.astype(np.float32)
 
 

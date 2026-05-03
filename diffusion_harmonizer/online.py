@@ -72,9 +72,11 @@ class OnlineConfig:
     physx_buffer_scale: float = 0.1
     components: tuple[str, ...] = ("isp_modification", "shadow_simulation")
     isp_full_frame_fraction: float = 0.0
-    # 0.25 ≈ ±0.4 EV, ±12% saturation, ±4° hue, ±0.2 gamma, ±625 K WB —
-    # paper-like subtle tone mismatch (object identity preserved).
-    isp_strength: float = 0.25
+    # Linear-pipeline ISP. 0.5 -> half-amplitude around identity for every
+    # knob (exposure, gains, CCM noise, gamma, contrast, brightness, sat).
+    # Paper-faithful subtle tone mismatch; raise toward 1.0 for sharper
+    # "different camera ISP" look.
+    isp_strength: float = 0.5
     shadow_min_coverage: float = 0.0008
     # Per-episode randomized sun for visible cast shadows. Smaller angular size
     # = sharper shadow edges; higher intensity = stronger contrast vs the dome.
@@ -193,7 +195,6 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
             capture_steps = _capture_steps(num_steps, cfg.captures_per_episode)
 
             held_actions = None
-            pt_active = False
             for step in range(num_steps):
                 if episode_actions is not None:
                     actions_np = episode_actions[step]
@@ -208,19 +209,10 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
                             env.single_action_space, device=env.device, batch_size=env.num_envs
                         )
 
-                will_capture = step in capture_steps
-                if cfg.use_path_tracing:
-                    if will_capture and not pt_active:
-                        runtime.set_path_tracing(True, spp=cfg.spp)
-                        _kit_update()
-                        pt_active = True
-                    elif not will_capture and pt_active:
-                        runtime.set_path_tracing(False)
-                        pt_active = False
-
+                # Trajectory steps run rasterized (cheap, deterministic).
                 obs, _, _, _, _ = env.step(held_actions)
 
-                if not will_capture:
+                if step not in capture_steps:
                     continue
 
                 joint_pos = env.scene["robot"].data.joint_pos[0].detach().cpu().numpy()
@@ -229,42 +221,72 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
                     f"robot joint_pos[:3]={tuple(round(float(j), 3) for j in joint_pos[:3])}",
                     flush=True,
                 )
-                for camera_name in cameras:
-                    target_rgb = _unpack_rgb(obs, camera_name)
-                    if target_rgb is None:
-                        continue
-                    tag = f"e{episode:02d}_s{step:03d}_{camera_name}"
 
-                    # Object-only mask via visibility-diff. We hide the
-                    # objects (NOT the robot) so the mask covers only the
-                    # ISP-eligible inserted assets.
-                    if objects_only:
-                        runtime.set_prims_visibility(objects_only, False)
-                        _kit_update()
-                        obs_bg, _, _, _, _ = env.step(held_actions)
-                        bg_rgb = _unpack_rgb(obs_bg, camera_name)
-                        runtime.set_prims_visibility(objects_only, True)
-                        _kit_update()
-                        object_mask = foreground_mask_from_visibility_difference(target_rgb, bg_rgb, threshold=0.10)
-                        object_mask = feather_mask(object_mask, sigma=2.0)
-                    else:
-                        object_mask = np.zeros(target_rgb.shape[:2], dtype=np.float32)
+                # Mask via visibility-difference in RASTERIZATION.
+                # Path-traced renders have ~5-10% per-pixel noise at spp=8;
+                # the diff threshold of 0.15 then catches noise everywhere
+                # and the mask leaks onto receivers (table, plate). The
+                # rasterized vis-diff is deterministic — diff = exactly the
+                # object pixels minus a few edge stragglers we morph away.
+                target_rgb_raster = _unpack_rgb(obs, cameras[0])  # any camera works as a sentinel
+                object_masks: dict[str, np.ndarray] = {}
+                if objects_only:
+                    runtime.set_prims_visibility(objects_only, False)
+                    _kit_update()
+                    obs_bg, _, _, _, _ = env.step(held_actions)
+                    runtime.set_prims_visibility(objects_only, True)
+                    _kit_update()
+                    for camera_name in cameras:
+                        tgt = _unpack_rgb(obs, camera_name)
+                        bg = _unpack_rgb(obs_bg, camera_name)
+                        if tgt is None or bg is None:
+                            continue
+                        m = foreground_mask_from_visibility_difference(tgt, bg, threshold=0.15)
+                        object_masks[camera_name] = feather_mask(m, sigma=2.0)
+                else:
+                    for camera_name in cameras:
+                        tgt = _unpack_rgb(obs, camera_name)
+                        if tgt is not None:
+                            object_masks[camera_name] = np.zeros(tgt.shape[:2], dtype=np.float32)
 
-                    if "isp_modification" in cfg.components:
+                # Build ISP pairs from the (rasterized) target — software ISP
+                # doesn't need PT and keeps the mask self-consistent.
+                if "isp_modification" in cfg.components:
+                    for camera_name in cameras:
+                        target_rgb = _unpack_rgb(obs, camera_name)
+                        if target_rgb is None:
+                            continue
+                        tag = f"e{episode:02d}_s{step:03d}_{camera_name}"
                         if _build_isp_pair(
-                            target_rgb, object_mask, isp_dir / tag, rng, cfg, camera_name,
+                            target_rgb,
+                            object_masks.get(camera_name, np.zeros(target_rgb.shape[:2], dtype=np.float32)),
+                            isp_dir / tag, rng, cfg, camera_name,
                         ):
                             isp_count += 1
 
-                    if "shadow_simulation" in cfg.components and full_foreground:
-                        runtime.set_shadow_link_excludes(full_foreground, enabled=True)
-                        _kit_update()  # flush USD attr change before re-render
-                        obs_ns, _, _, _, _ = env.step(held_actions)
-                        no_shadow_rgb = _unpack_rgb(obs_ns, camera_name)
-                        runtime.set_shadow_link_excludes(full_foreground, enabled=False)
+                # Switch to PT for the shadow pair: TiledCamera rasterization
+                # honours UsdLux.shadowLink poorly. PT respects it precisely.
+                if "shadow_simulation" in cfg.components and full_foreground:
+                    if cfg.use_path_tracing:
+                        runtime.set_path_tracing(True, spp=cfg.spp)
                         _kit_update()
+                    obs_t, _, _, _, _ = env.step(held_actions)
+                    runtime.set_shadow_link_excludes(full_foreground, enabled=True)
+                    _kit_update()
+                    obs_ns, _, _, _, _ = env.step(held_actions)
+                    runtime.set_shadow_link_excludes(full_foreground, enabled=False)
+                    _kit_update()
+                    if cfg.use_path_tracing:
+                        runtime.set_path_tracing(False)
+                    for camera_name in cameras:
+                        target_pt = _unpack_rgb(obs_t, camera_name)
+                        no_shadow = _unpack_rgb(obs_ns, camera_name)
+                        if target_pt is None or no_shadow is None:
+                            continue
+                        tag = f"e{episode:02d}_s{step:03d}_{camera_name}"
                         if _build_shadow_pair(
-                            target_rgb, no_shadow_rgb, object_mask,
+                            target_pt, no_shadow,
+                            object_masks.get(camera_name, np.zeros(target_pt.shape[:2], dtype=np.float32)),
                             shadow_dir / tag, cfg, camera_name,
                         ):
                             shadow_count += 1
