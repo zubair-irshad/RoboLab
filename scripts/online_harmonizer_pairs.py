@@ -34,24 +34,30 @@ parser.add_argument("--output-root", default="data/diffusion_harmonizer")
 parser.add_argument("--components", nargs="+", default=["isp_modification", "shadow_simulation"],
                     choices=("isp_modification", "shadow_simulation"))
 parser.add_argument("--num-episodes", type=int, default=3)
-parser.add_argument("--num-steps", type=int, default=30,
-                    help="Sample-action steps per episode (matches run_empty.py default of 50).")
+parser.add_argument("--num-steps", type=int, default=60,
+                    help="Sample-action steps per episode. Larger = more robot motion across captures.")
 parser.add_argument("--captures-per-episode", type=int, default=4,
                     help="How many evenly-spaced steps per episode produce paired data (2-5 recommended).")
 parser.add_argument("--cameras", nargs="+", default=None,
                     help="Subset of camera names to capture from (e.g. --cameras external_cam wrist_cam). "
                          "Default auto-picks every TiledCamera the env exposes.")
-parser.add_argument("--action-hold-steps", type=int, default=5,
+parser.add_argument("--action-hold-steps", type=int, default=10,
                     help="Hold each sampled action this many physics steps so the PD controller actually tracks it. "
-                         "0 or 1 = re-sample every step (robot barely moves).")
+                         "0 or 1 = re-sample every step (robot chases unreachable targets and barely moves).")
+parser.add_argument("--isp-strength", type=float, default=0.3,
+                    help="ISP perturbation magnitude (0 = identity, 1 = aggressive). Paper-faithful ~0.3 produces "
+                         "subtle tone mismatch; >0.6 produces unrealistic full color swaps.")
+parser.add_argument("--spp", type=int, default=8,
+                    help="Path-tracing samples per pixel during capture. Lower = faster but noisier shadows.")
+parser.add_argument("--no-path-tracing", dest="use_path_tracing", action="store_false", default=True,
+                    help="Skip path tracing during capture. Shadows will not visibly toggle in the rasterizer.")
 parser.add_argument("--sun-intensity-range", type=float, nargs=2, default=(1500.0, 4000.0))
 parser.add_argument("--sun-angle-deg-range", type=float, nargs=2, default=(1.0, 6.0))
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--num-envs", type=int, default=1)
 parser.add_argument("--physx-buffer-scale", type=float, default=0.1)
-parser.add_argument("--isp-full-frame-fraction", type=float, default=0.2)
-parser.add_argument("--isp-strength", type=float, default=0.8)
-parser.add_argument("--shadow-min-coverage", type=float, default=0.001)
+parser.add_argument("--isp-full-frame-fraction", type=float, default=0.0)
+parser.add_argument("--shadow-min-coverage", type=float, default=0.0008)
 parser.add_argument("--no-headless", dest="headless_override", action="store_false", default=True)
 
 AppLauncher.add_app_launcher_args(parser)
@@ -103,6 +109,8 @@ def main() -> None:
         action_hold_steps=args_cli.action_hold_steps,
         sun_intensity_range=tuple(args_cli.sun_intensity_range),
         sun_angle_deg_range=tuple(args_cli.sun_angle_deg_range),
+        use_path_tracing=args_cli.use_path_tracing,
+        spp=args_cli.spp,
     )
     print(f"[online] running on {len(env_names)} env(s) -> {cfg.output_root}", flush=True)
     summary = run_online(env_names, cfg)

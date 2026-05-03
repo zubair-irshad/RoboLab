@@ -63,21 +63,28 @@ _CAMERA_CANDIDATES = (
 class OnlineConfig:
     output_root: Path = Path("data/diffusion_harmonizer")
     num_episodes: int = 3
-    num_steps_per_episode: int = 30
+    num_steps_per_episode: int = 60
     captures_per_episode: int = 4
-    action_hold_steps: int = 5  # repeat the same sampled action this many times before re-sampling
+    action_hold_steps: int = 10  # held long enough for the PD controller to actually track each target
     seed: int = 42
     device: str = "cuda:0"
     num_envs: int = 1
     physx_buffer_scale: float = 0.1
     components: tuple[str, ...] = ("isp_modification", "shadow_simulation")
-    isp_full_frame_fraction: float = 0.0  # paper applies ISP to objects, not full frame
-    isp_strength: float = 0.8
-    shadow_min_coverage: float = 0.001
-    # Per-episode randomized sun for visible cast shadows.
-    sun_intensity_range: tuple[float, float] = (1500.0, 4000.0)
-    sun_angle_deg_range: tuple[float, float] = (1.0, 6.0)
-    cameras: tuple[str, ...] | None = None  # auto-pick from env.scene if None
+    isp_full_frame_fraction: float = 0.0
+    # 0.3 ≈ ±0.45 EV, ±15% saturation, ±5° hue, ±0.25 gamma — paper-like subtle
+    # tone mismatch rather than a wholesale color swap.
+    isp_strength: float = 0.3
+    shadow_min_coverage: float = 0.0008
+    # Per-episode randomized sun for visible cast shadows. Smaller angular size
+    # = sharper shadow edges; higher intensity = stronger contrast vs the dome.
+    sun_intensity_range: tuple[float, float] = (3000.0, 8000.0)
+    sun_angle_deg_range: tuple[float, float] = (0.5, 3.0)
+    # Force path tracing during capture so the rasterizer's shadowLink
+    # limitations don't make shadow toggles invisible.
+    use_path_tracing: bool = True
+    spp: int = 8
+    cameras: tuple[str, ...] | None = None
 
 
 def run_online(env_names: list[str], cfg: OnlineConfig) -> dict:
@@ -125,6 +132,13 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
         print(f"[online:{env_name}] objects (ISP scope):  {objects_only}", flush=True)
         print(f"[online:{env_name}] cameras:              {cameras}", flush=True)
 
+        # TiledCamera rasterization barely respects USD shadowLink. Path
+        # tracing does. Switch the renderer once at startup so every env.step
+        # below produces a path-traced frame.
+        if cfg.use_path_tracing:
+            runtime.set_path_tracing(True, spp=cfg.spp)
+            print(f"[online:{env_name}] path tracing ENABLED (spp={cfg.spp})", flush=True)
+
         rng = random.Random(cfg.seed)
         isp_count = 0
         shadow_count = 0
@@ -155,7 +169,12 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
                 if step not in capture_steps:
                     continue
 
-                print(f"[online:{env_name}]   capturing at step {step}", flush=True)
+                joint_pos = env.scene["robot"].data.joint_pos[0].detach().cpu().numpy()
+                print(
+                    f"[online:{env_name}]   capturing at step {step} — "
+                    f"robot joint_pos[:3]={tuple(round(float(j), 3) for j in joint_pos[:3])}",
+                    flush=True,
+                )
                 for camera_name in cameras:
                     target_rgb = _unpack_rgb(obs, camera_name)
                     if target_rgb is None:
@@ -167,9 +186,11 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
                     # ISP-eligible inserted assets.
                     if objects_only:
                         runtime.set_prims_visibility(objects_only, False)
+                        _kit_update()
                         obs_bg, _, _, _, _ = env.step(held_actions)
                         bg_rgb = _unpack_rgb(obs_bg, camera_name)
                         runtime.set_prims_visibility(objects_only, True)
+                        _kit_update()
                         object_mask = foreground_mask_from_visibility_difference(target_rgb, bg_rgb, threshold=0.10)
                         object_mask = feather_mask(object_mask, sigma=2.0)
                     else:
@@ -183,9 +204,11 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
 
                     if "shadow_simulation" in cfg.components and full_foreground:
                         runtime.set_shadow_link_excludes(full_foreground, enabled=True)
+                        _kit_update()  # flush USD attr change before re-render
                         obs_ns, _, _, _, _ = env.step(held_actions)
                         no_shadow_rgb = _unpack_rgb(obs_ns, camera_name)
                         runtime.set_shadow_link_excludes(full_foreground, enabled=False)
+                        _kit_update()
                         if _build_shadow_pair(
                             target_rgb, no_shadow_rgb, object_mask,
                             shadow_dir / tag, cfg, camera_name,
@@ -316,6 +339,17 @@ def _dilate(mask: np.ndarray, pixels: int = 7) -> np.ndarray:
 def _shadow_delta(target: np.ndarray, no_shadow: np.ndarray, fg_dilated: np.ndarray) -> np.ndarray:
     diff = np.max(np.abs(target.astype(np.float32) - no_shadow.astype(np.float32)), axis=-1) / 255.0
     return np.clip(diff * (1.0 - np.clip(fg_dilated, 0.0, 1.0)), 0.0, 1.0)
+
+
+def _kit_update() -> None:
+    """Pump the Omniverse Kit app once so USD attribute changes propagate to the renderer."""
+
+    try:
+        import omni.kit.app
+
+        omni.kit.app.get_app().update()
+    except Exception:
+        pass
 
 
 def _release_cuda_memory() -> None:
