@@ -118,10 +118,28 @@ class HarmonizerRuntime:
         return [n for n in names if isinstance(n, str)]
 
     def foreground_prim_paths(self) -> list[str]:
-        """Robot + every non-receiver entry from ``contact_object_list``."""
+        """Robot + every non-receiver entry from ``contact_object_list``.
 
-        objects = [name for name in self.contact_object_names() if not _looks_like_receiver(name)]
-        return [self.robot_prim_path] + [f"{self.scene_root_prim_path}/{name}" for name in objects]
+        Used by shadow simulation (the robot also casts shadows we want to
+        learn) and asset re-insertion (the robot is foreground that gets
+        composited over the gsplat background).
+        """
+
+        return [self.robot_prim_path] + self.object_prim_paths()
+
+    def object_prim_paths(self) -> list[str]:
+        """Manipulable objects only - excludes the robot and receivers.
+
+        Used by ISP modification: paper applies ISP to *inserted* objects so
+        they look tonally mismatched against the background; the robot is part
+        of the embodiment / native scene and should not be ISP-perturbed.
+        """
+
+        return [
+            f"{self.scene_root_prim_path}/{name}"
+            for name in self.contact_object_names()
+            if not _looks_like_receiver(name)
+        ]
 
     def receiver_prim_paths(self) -> list[str]:
         return [
@@ -340,6 +358,36 @@ class HarmonizerRuntime:
         if rotation_deg is not None:
             xf = UsdGeom.Xformable(prim)
             _set_xform_op(xf, UsdGeom.XformOp.TypeRotateXYZ, (0.0, 0.0, float(rotation_deg)), double=False)
+
+    def set_distant_light(
+        self,
+        prim_path: str = "/World/HarmonizerSun",
+        intensity: float | None = 3000.0,
+        angle_deg: float = 2.0,
+        direction: tuple[float, float, float] = (0.3, 0.4, -1.0),
+    ) -> None:
+        """Create or update a directional sun light for visible cast shadows.
+
+        Dome HDRIs alone produce soft ambient illumination, so shadowLink
+        excludes barely change the receiver. A directional sun gives crisp
+        cast shadows that disappear sharply when foreground is excluded from
+        the shadow-caster collection — which is what the shadow-simulation
+        component needs.
+
+        Pass ``intensity=None`` to delete the prim.
+        """
+
+        from pxr import Gf, UsdGeom, UsdLux
+
+        if intensity is None:
+            self.stage.RemovePrim(prim_path)
+            return
+        light = UsdLux.DistantLight.Define(self.stage, prim_path)
+        light.CreateIntensityAttr(float(intensity))
+        light.CreateAngleAttr(float(angle_deg))
+        quat = _lookat_quaternion((0.0, 0.0, 0.0), tuple(direction))
+        xf = UsdGeom.Xformable(light.GetPrim())
+        _set_orient_quat(xf, quat)
 
     def set_path_tracing(self, enabled: bool, spp: int = 64) -> None:
         import carb

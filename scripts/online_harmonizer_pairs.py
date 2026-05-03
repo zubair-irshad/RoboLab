@@ -38,8 +38,14 @@ parser.add_argument("--num-steps", type=int, default=30,
                     help="Sample-action steps per episode (matches run_empty.py default of 50).")
 parser.add_argument("--captures-per-episode", type=int, default=4,
                     help="How many evenly-spaced steps per episode produce paired data (2-5 recommended).")
-parser.add_argument("--camera", default=None,
-                    help="Override the camera name used for capture; default auto-picks from env.scene.sensors.")
+parser.add_argument("--cameras", nargs="+", default=None,
+                    help="Subset of camera names to capture from (e.g. --cameras external_cam wrist_cam). "
+                         "Default auto-picks every TiledCamera the env exposes.")
+parser.add_argument("--action-hold-steps", type=int, default=5,
+                    help="Hold each sampled action this many physics steps so the PD controller actually tracks it. "
+                         "0 or 1 = re-sample every step (robot barely moves).")
+parser.add_argument("--sun-intensity-range", type=float, nargs=2, default=(1500.0, 4000.0))
+parser.add_argument("--sun-angle-deg-range", type=float, nargs=2, default=(1.0, 6.0))
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--num-envs", type=int, default=1)
 parser.add_argument("--physx-buffer-scale", type=float, default=0.1)
@@ -93,7 +99,10 @@ def main() -> None:
         isp_full_frame_fraction=args_cli.isp_full_frame_fraction,
         isp_strength=args_cli.isp_strength,
         shadow_min_coverage=args_cli.shadow_min_coverage,
-        camera_name=args_cli.camera,
+        cameras=tuple(args_cli.cameras) if args_cli.cameras else None,
+        action_hold_steps=args_cli.action_hold_steps,
+        sun_intensity_range=tuple(args_cli.sun_intensity_range),
+        sun_angle_deg_range=tuple(args_cli.sun_angle_deg_range),
     )
     print(f"[online] running on {len(env_names)} env(s) -> {cfg.output_root}", flush=True)
     summary = run_online(env_names, cfg)
