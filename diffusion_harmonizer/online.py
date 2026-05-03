@@ -87,14 +87,19 @@ class OnlineConfig:
     # change overall illumination direction without swapping textures.
     randomize_dome_rotation: bool = True
     # Hemispheric multi-view snapshot feeding the offline gsplat artifacts
-    # builder. 30 covers DIFIX3D+ sparse / cycle / cross-ref / underfit; pass
-    # 0 to skip the snapshot entirely.
-    hemisphere_cameras: int = 30
-    hemisphere_radius: float = 1.6
+    # builder. 100 views give DIFIX3D+ enough coverage to play train / hold
+    # splits cleanly; pass 0 to skip the snapshot entirely.
+    hemisphere_cameras: int = 100
+    # Radius is sampled per view from this inclusive range — random radii give
+    # the four DIFIX3D+ strategies more varied frustums than a fixed radius.
+    hemisphere_radius_range: tuple[float, float] = (1.1, 1.6)
     hemisphere_center: tuple[float, float, float] = (0.4, 0.0, 0.4)
     hemisphere_resolution: tuple[int, int] = (512, 512)
     hemisphere_spp: int = 16
-    hemisphere_settle_steps: int = 5
+    # 0 = take the snapshot from the post-reset pose. Any non-zero value
+    # samples random sample_space actions and drags the robot somewhere
+    # unrelated to the trajectory's reset pose, which is rarely what we want.
+    hemisphere_settle_steps: int = 0
     # Force path tracing during capture so the rasterizer's shadowLink
     # limitations don't make shadow toggles invisible.
     use_path_tracing: bool = True
@@ -458,9 +463,10 @@ def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: OnlineConfig, env
     original_pos = base_cam.data.pos_w[0].clone()
     original_quat = base_cam.data.quat_w_world[0].clone()
 
+    r_lo, r_hi = cfg.hemisphere_radius_range
     print(
         f"[online:{env_name}] hemispheric snapshot via {cam_name}: "
-        f"{cfg.hemisphere_cameras} views radius={cfg.hemisphere_radius} spp={cfg.hemisphere_spp}",
+        f"{cfg.hemisphere_cameras} views radius∈[{r_lo:.2f}, {r_hi:.2f}] spp={cfg.hemisphere_spp}",
         flush=True,
     )
 
@@ -472,7 +478,10 @@ def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: OnlineConfig, env
 
     center = np.asarray(cfg.hemisphere_center, dtype=np.float64)
     up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    eyes = _fibonacci_hemisphere_eyes(cfg.hemisphere_cameras, cfg.hemisphere_radius, center)
+    snapshot_rng = random.Random(cfg.seed)
+    eyes = _fibonacci_hemisphere_eyes(
+        cfg.hemisphere_cameras, cfg.hemisphere_radius_range, center, snapshot_rng,
+    )
 
     manifest_views = []
     t0 = _time.time()
@@ -555,7 +564,7 @@ def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: OnlineConfig, env
             "resolution": list(cfg.hemisphere_resolution),
             "spp": cfg.hemisphere_spp,
             "center": list(cfg.hemisphere_center),
-            "radius": cfg.hemisphere_radius,
+            "radius_range": list(cfg.hemisphere_radius_range),
             "views": manifest_views,
         },
     )
@@ -566,22 +575,31 @@ def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: OnlineConfig, env
     )
 
 
-def _fibonacci_hemisphere_eyes(num: int, radius: float, center: np.ndarray) -> np.ndarray:
+def _fibonacci_hemisphere_eyes(
+    num: int,
+    radius_range: tuple[float, float],
+    center: np.ndarray,
+    rng: random.Random,
+) -> np.ndarray:
     """Fibonacci spiral over the upper hemisphere (z >= 0 in world frame).
 
-    Pinches off the exact zenith / equator (z in [0.05, 0.95]) so the
-    look-at quaternion stays well-conditioned and views don't peer along
-    the up vector.
+    Each eye gets a random radius drawn from ``radius_range`` so frustums
+    differ across views — gives the four DIFIX3D+ strategies more varied
+    train / hold-out splits than a fixed radius would. Pinches off the
+    exact zenith / equator (z in [0.05, 0.95]) so the look-at quaternion
+    stays well-conditioned.
     """
 
     golden = np.pi * (3.0 - np.sqrt(5.0))
+    r_lo, r_hi = float(radius_range[0]), float(radius_range[1])
     pts = []
     for i in range(num):
         z = 0.05 + 0.9 * (i / max(num - 1, 1))
-        r = np.sqrt(max(0.0, 1.0 - z * z))
+        r_unit = np.sqrt(max(0.0, 1.0 - z * z))
         theta = golden * i
-        x = r * np.cos(theta)
-        y = r * np.sin(theta)
+        x = r_unit * np.cos(theta)
+        y = r_unit * np.sin(theta)
+        radius = rng.uniform(r_lo, r_hi)
         pts.append(center + radius * np.array([x, y, z], dtype=np.float64))
     return np.stack(pts, axis=0)
 

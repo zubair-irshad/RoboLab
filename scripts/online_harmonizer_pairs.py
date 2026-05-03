@@ -36,14 +36,17 @@ parser.add_argument("--components", nargs="+",
                     choices=("isp_modification", "shadow_simulation", "artifacts_correction"))
 parser.add_argument("--no-randomize-dome", dest="randomize_dome_rotation", action="store_false", default=True,
                     help="Skip per-capture dome rotation. Lighting still varies via random sun direction.")
-parser.add_argument("--hemisphere-cameras", type=int, default=30,
+parser.add_argument("--hemisphere-cameras", type=int, default=100,
                     help="Number of hemispheric views to snapshot once per env for the offline gsplat "
                          "artifacts-correction builder. Pass 0 to skip the snapshot.")
-parser.add_argument("--hemisphere-radius", type=float, default=1.6)
+parser.add_argument("--hemisphere-radius-range", type=float, nargs=2, default=(1.1, 1.6),
+                    help="Per-view radius is sampled uniformly from this range for varied frustums.")
 parser.add_argument("--hemisphere-center", type=float, nargs=3, default=(0.4, 0.0, 0.4))
 parser.add_argument("--hemisphere-resolution", type=int, nargs=2, default=(512, 512))
 parser.add_argument("--hemisphere-spp", type=int, default=16)
-parser.add_argument("--hemisphere-settle-steps", type=int, default=5)
+parser.add_argument("--hemisphere-settle-steps", type=int, default=0,
+                    help="Random sample-action steps before the snapshot. 0 (default) snapshots from the "
+                         "post-reset pose so the robot looks the same as in ISP/shadow trajectory captures.")
 parser.add_argument("--num-episodes", type=int, default=3)
 parser.add_argument("--num-steps", type=int, default=60,
                     help="Sample-action steps per episode. Larger = more robot motion across captures.")
@@ -132,7 +135,7 @@ def main() -> None:
         playback_data_root=None if args_cli.playback_disabled else Path(args_cli.playback_data_root),
         randomize_dome_rotation=args_cli.randomize_dome_rotation,
         hemisphere_cameras=args_cli.hemisphere_cameras,
-        hemisphere_radius=args_cli.hemisphere_radius,
+        hemisphere_radius_range=tuple(args_cli.hemisphere_radius_range),
         hemisphere_center=tuple(args_cli.hemisphere_center),
         hemisphere_resolution=tuple(args_cli.hemisphere_resolution),
         hemisphere_spp=args_cli.hemisphere_spp,
