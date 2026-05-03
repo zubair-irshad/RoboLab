@@ -170,16 +170,20 @@ def train_and_render(
     for tensor in params.values():
         tensor.requires_grad_(True)
 
-    optimizer = torch.optim.Adam(
-        [
-            {"params": [params["means"]], "lr": cfg.learning_rate_means, "name": "means"},
-            {"params": [params["quats"]], "lr": cfg.learning_rate_quats, "name": "quats"},
-            {"params": [params["scales"]], "lr": cfg.learning_rate_scales, "name": "scales"},
-            {"params": [params["opacities"]], "lr": cfg.learning_rate_opacities, "name": "opacities"},
-            {"params": [params["sh0"]], "lr": cfg.learning_rate_sh, "name": "sh0"},
-            {"params": [params["shN"]], "lr": cfg.learning_rate_sh / 20.0, "name": "shN"},
-        ]
-    )
+    # gsplat's DefaultStrategy.check_sanity expects ``optimizers`` to be a
+    # dict keyed by parameter name (one Adam per param), not a single multi
+    # -group Adam. With a single Adam check_sanity does ``optimizers.keys()``
+    # and crashes with AttributeError. One optimizer per param matches the
+    # gsplat reference implementation and lets the strategy mutate state per
+    # parameter independently during densify / prune.
+    optimizers = {
+        "means": torch.optim.Adam([params["means"]], lr=cfg.learning_rate_means),
+        "quats": torch.optim.Adam([params["quats"]], lr=cfg.learning_rate_quats),
+        "scales": torch.optim.Adam([params["scales"]], lr=cfg.learning_rate_scales),
+        "opacities": torch.optim.Adam([params["opacities"]], lr=cfg.learning_rate_opacities),
+        "sh0": torch.optim.Adam([params["sh0"]], lr=cfg.learning_rate_sh),
+        "shN": torch.optim.Adam([params["shN"]], lr=cfg.learning_rate_sh / 20.0),
+    }
 
     strategy = None
     strategy_state = None
@@ -191,7 +195,7 @@ def train_and_render(
             grow_grad2d=cfg.densification_threshold,
             prune_opa=cfg.pruning_threshold,
         )
-        strategy.check_sanity(params, optimizer)
+        strategy.check_sanity(params, optimizers)
         strategy_state = strategy.initialize_state()
 
     rasterize_mode = "antialiased" if cfg.splat_kind == "3dgs" else "RGB+ED"
@@ -202,13 +206,15 @@ def train_and_render(
         target = torch.tensor(view.rgb, dtype=torch.float32, device=params["means"].device) / 255.0
         rendered, alpha, info = _render_single(view, params, cfg, bg_color, rasterize_mode)
         loss = (rendered - target).abs().mean() + 0.1 * (1.0 - _ssim(rendered, target))
+        for opt in optimizers.values():
+            opt.zero_grad(set_to_none=True)
+        if strategy is not None:
+            strategy.step_pre_backward(params, optimizers, strategy_state, step, info)
         loss.backward()
+        for opt in optimizers.values():
+            opt.step()
         if strategy is not None:
-            strategy.step_pre_backward(params, optimizer, strategy_state, step, info)
-        optimizer.step()
-        if strategy is not None:
-            strategy.step_post_backward(params, optimizer, strategy_state, step, info)
-        optimizer.zero_grad(set_to_none=True)
+            strategy.step_post_backward(params, optimizers, strategy_state, step, info)
         if progress_cb and step % 200 == 0:
             progress_cb(step, float(loss.detach().cpu()))
 

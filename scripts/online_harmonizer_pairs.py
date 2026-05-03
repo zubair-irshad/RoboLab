@@ -32,21 +32,12 @@ parser.add_argument("--tag", nargs="*", default=None)
 parser.add_argument("--limit", type=int, default=None)
 parser.add_argument("--output-root", default="data/diffusion_harmonizer")
 parser.add_argument("--components", nargs="+",
-                    default=["isp_modification", "shadow_simulation", "artifacts_correction"],
-                    choices=("isp_modification", "shadow_simulation", "artifacts_correction"))
+                    default=["isp_modification", "shadow_simulation"],
+                    choices=("isp_modification", "shadow_simulation"),
+                    help="Trajectory-driven components only. For artifacts_correction "
+                         "(hemispheric capture + offline gsplat) use scripts/capture_artifact_views.py.")
 parser.add_argument("--no-randomize-dome", dest="randomize_dome_rotation", action="store_false", default=True,
                     help="Skip per-capture dome rotation. Lighting still varies via random sun direction.")
-parser.add_argument("--hemisphere-cameras", type=int, default=100,
-                    help="Number of hemispheric views to snapshot once per env for the offline gsplat "
-                         "artifacts-correction builder. Pass 0 to skip the snapshot.")
-parser.add_argument("--hemisphere-radius-range", type=float, nargs=2, default=(1.1, 1.6),
-                    help="Per-view radius is sampled uniformly from this range for varied frustums.")
-parser.add_argument("--hemisphere-center", type=float, nargs=3, default=(0.4, 0.0, 0.4))
-parser.add_argument("--hemisphere-resolution", type=int, nargs=2, default=(512, 512))
-parser.add_argument("--hemisphere-spp", type=int, default=16)
-parser.add_argument("--hemisphere-settle-steps", type=int, default=0,
-                    help="Random sample-action steps before the snapshot. 0 (default) snapshots from the "
-                         "post-reset pose so the robot looks the same as in ISP/shadow trajectory captures.")
 parser.add_argument("--num-episodes", type=int, default=3)
 parser.add_argument("--num-steps", type=int, default=60,
                     help="Sample-action steps per episode. Larger = more robot motion across captures.")
@@ -134,12 +125,6 @@ def main() -> None:
         spp=args_cli.spp,
         playback_data_root=None if args_cli.playback_disabled else Path(args_cli.playback_data_root),
         randomize_dome_rotation=args_cli.randomize_dome_rotation,
-        hemisphere_cameras=args_cli.hemisphere_cameras,
-        hemisphere_radius_range=tuple(args_cli.hemisphere_radius_range),
-        hemisphere_center=tuple(args_cli.hemisphere_center),
-        hemisphere_resolution=tuple(args_cli.hemisphere_resolution),
-        hemisphere_spp=args_cli.hemisphere_spp,
-        hemisphere_settle_steps=args_cli.hemisphere_settle_steps,
     )
     print(f"[online] running on {len(env_names)} env(s) -> {cfg.output_root}", flush=True)
     summary = run_online(env_names, cfg)
