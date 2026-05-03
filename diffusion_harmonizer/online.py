@@ -1,22 +1,25 @@
 """Online (per-trajectory) DiffusionHarmonizer pair generator.
 
-Models ``examples/demo/run_empty.py``: for each registered task, create the
-env, add 1-2 cameras, then run ``num_episodes`` × ``num_steps_per_episode``
-steps. At every step we capture from each camera and emit:
+Models ``examples/demo/run_empty.py`` exactly:
 
-  * **ISP modification** pair  — software-ISP applied through the foreground
-    mask, composited with Eq. (3).
-  * **Shadow simulation** pair — same view rendered twice (shadows on, then
-    foreground excluded from ``UsdLux.shadowLink``), paired as
-    ``input=no-shadow``, ``target=full-shadow``.
+  * one Isaac Sim launch (the CLI driver does it via ``AppLauncher``)
+  * for each registered task: ``create_env(task)`` -> ``env.reset()`` ->
+    ``env.step(sample_space_action)`` for ``num_steps`` per ``num_episodes``
+  * pull rgb out of the env's own camera via ``unpack_image_obs(obs)`` —
+    *no* Replicator, *no* extra cameras attached to the stage. The TiledCamera
+    that RoboLab already wires into ``env.scene`` is what we read from.
 
-Trajectory diversity (random sampled actions, fresh contacts, varying robot
-poses) gives many distinct paired examples per task per minute of Isaac Sim
-runtime — far cheaper than re-launching the simulator for each scene.
+Per capture we generate two paired-data items:
 
-Use the offline ``capture_harmonizer_views.py`` + gsplat builders for the
-artifacts-correction and asset-reinsertion components. Those need a static
-100-camera sphere capture and are not amortizable into a trajectory loop.
+  * ISP modification — composite Eq. (3) using a software-ISP and a foreground
+    mask derived from a visibility-difference (foreground hidden + a hold-pose
+    re-render). No segmentation annotator needed.
+  * Shadow simulation — toggle every light's ``UsdLux.shadowLink`` to exclude
+    the foreground, take a hold-pose re-render, pair as
+    ``input=no_shadow`` / ``target=full_shadow``.
+
+We sample only ``captures_per_episode`` evenly-spaced steps per episode so the
+data isn't dominated by near-duplicate consecutive frames.
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ import numpy as np
 
 from diffusion_harmonizer.components.common import (
     feather_mask,
-    foreground_mask_with_fallback,
+    foreground_mask_from_visibility_difference,
 )
 from diffusion_harmonizer.components.isp_modification import (
     apply_software_isp,
@@ -41,21 +44,23 @@ from diffusion_harmonizer.image_io import save_json, save_png, write_pair
 from diffusion_harmonizer.runtime import HarmonizerRuntime
 
 
+# RoboLab tasks are typically registered with one or both of these. We pick
+# the first one that's actually present on the env scene.
+_CAMERA_CANDIDATES = (
+    "over_shoulder_left_camera",
+    "external_cam",
+    "head_camera",
+    "egocentric_mirrored_camera",
+    "wrist_cam",
+)
+
+
 @dataclass
 class OnlineConfig:
     output_root: Path = Path("data/diffusion_harmonizer")
-    # Camera placement around the workspace. Pick 1-2 angles that see the
-    # full table + robot arm. Default is two over-shoulder-style orbit cams.
-    num_cameras: int = 2
-    camera_radius: float = 1.6
-    camera_center: tuple[float, float, float] = (0.4, 0.0, 0.4)
-    camera_height: float = 0.6
-    capture_resolution: tuple[int, int] = (512, 512)
-    spp: int = 4
-    # Trajectory geometry. ``num_steps_per_episode`` matches run_empty's default.
     num_episodes: int = 3
     num_steps_per_episode: int = 30
-    capture_every_n_steps: int = 1
+    captures_per_episode: int = 4  # 2-5 spaced evenly across the episode
     seed: int = 42
     device: str = "cuda:0"
     num_envs: int = 1
@@ -64,11 +69,10 @@ class OnlineConfig:
     isp_full_frame_fraction: float = 0.2
     isp_strength: float = 0.8
     shadow_min_coverage: float = 0.001
+    camera_name: str | None = None  # auto-pick from env.scene if None
 
 
 def run_online(env_names: list[str], cfg: OnlineConfig) -> dict:
-    """Run the per-trajectory paired-data loop over every requested env."""
-
     cfg.output_root.mkdir(parents=True, exist_ok=True)
     summary: dict = {"envs": {}, "started_at": time.time(), "config": _config_to_json(cfg)}
     save_json(cfg.output_root / "config.json", summary["config"])
@@ -91,6 +95,7 @@ def run_online(env_names: list[str], cfg: OnlineConfig) -> dict:
 
 def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
     from isaaclab.envs.utils.spaces import sample_space
+    from robolab.core.observations.observation_utils import unpack_image_obs
 
     env_dir = cfg.output_root / env_name
     isp_dir = env_dir / "02_isp_modification"
@@ -105,20 +110,11 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
         physx_buffer_scale=cfg.physx_buffer_scale,
     )
     try:
+        env = runtime.env
         foreground_paths = runtime.foreground_prim_paths()
+        camera_name = _pick_camera(env, cfg.camera_name)
         print(f"[online:{env_name}] foreground: {foreground_paths}", flush=True)
-        print(f"[online:{env_name}] receivers:  {runtime.receiver_prim_paths()}", flush=True)
-
-        cameras = runtime.add_orbit_cameras(
-            center=cfg.camera_center,
-            radius=cfg.camera_radius,
-            height=cfg.camera_height,
-            num_cameras=cfg.num_cameras,
-            resolution=cfg.capture_resolution,
-            name_prefix=f"online_{env_name}",
-        )
-        print(f"[online:{env_name}] added {len(cameras)} cameras", flush=True)
-        runtime.set_path_tracing(cfg.spp > 1, spp=cfg.spp)
+        print(f"[online:{env_name}] camera:     {camera_name}", flush=True)
 
         rng = random.Random(cfg.seed)
         isp_count = 0
@@ -126,32 +122,48 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
 
         for episode in range(cfg.num_episodes):
             print(f"[online:{env_name}] episode {episode + 1}/{cfg.num_episodes}", flush=True)
-            runtime.env.reset()
+            obs, _ = env.reset()
+            capture_steps = _capture_steps(cfg.num_steps_per_episode, cfg.captures_per_episode)
+
+            last_actions = None
             for step in range(cfg.num_steps_per_episode):
-                actions = sample_space(
-                    runtime.env.single_action_space,
-                    device=runtime.env.device,
-                    batch_size=runtime.env.num_envs,
-                )
-                runtime.env.step(actions)
+                actions = sample_space(env.single_action_space, device=env.device, batch_size=env.num_envs)
+                obs, _, _, _, _ = env.step(actions)
+                last_actions = actions
 
-                if step % cfg.capture_every_n_steps != 0:
-                    continue
+                if step in capture_steps:
+                    print(f"[online:{env_name}]   capturing at step {step}", flush=True)
+                    target_rgb = _unpack_rgb(obs, camera_name)
+                    if target_rgb is None:
+                        print(f"[online:{env_name}]   !! camera '{camera_name}' missing from obs at step {step}", flush=True)
+                        continue
 
-                for cam_idx, camera in enumerate(cameras):
-                    tag = f"e{episode:02d}_s{step:03d}_c{cam_idx:01d}"
+                    # Mask: hide foreground, hold-pose step, read camera again.
+                    runtime.set_prims_visibility(foreground_paths, False)
+                    obs_bg, _, _, _, _ = env.step(last_actions)
+                    bg_rgb = _unpack_rgb(obs_bg, camera_name)
+                    runtime.set_prims_visibility(foreground_paths, True)
+                    mask = foreground_mask_from_visibility_difference(target_rgb, bg_rgb, threshold=0.10)
+                    mask = feather_mask(mask, sigma=2.0)
+
                     if "isp_modification" in cfg.components:
-                        if _build_isp_pair(runtime, camera, isp_dir / tag, foreground_paths, rng, cfg):
+                        if _build_isp_pair(
+                            target_rgb, mask, isp_dir / f"e{episode:02d}_s{step:03d}",
+                            rng, cfg, camera_name,
+                        ):
                             isp_count += 1
+
                     if "shadow_simulation" in cfg.components:
-                        if _build_shadow_pair(runtime, camera, shadow_dir / tag, foreground_paths, cfg):
+                        runtime.set_shadow_link_excludes(foreground_paths, enabled=True)
+                        obs_ns, _, _, _, _ = env.step(last_actions)
+                        no_shadow_rgb = _unpack_rgb(obs_ns, camera_name)
+                        runtime.set_shadow_link_excludes(foreground_paths, enabled=False)
+                        if _build_shadow_pair(
+                            target_rgb, no_shadow_rgb, mask,
+                            shadow_dir / f"e{episode:02d}_s{step:03d}",
+                            cfg, camera_name,
+                        ):
                             shadow_count += 1
-                if (step + 1) % 10 == 0:
-                    print(
-                        f"[online:{env_name}]   step {step + 1}/{cfg.num_steps_per_episode}"
-                        f" — isp={isp_count} shadow={shadow_count}",
-                        flush=True,
-                    )
 
         print(f"[online:{env_name}] DONE — isp={isp_count} shadow={shadow_count}", flush=True)
         return {
@@ -160,7 +172,8 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
             "shadow_pairs": shadow_count,
             "episodes": cfg.num_episodes,
             "steps_per_episode": cfg.num_steps_per_episode,
-            "cameras": len(cameras),
+            "captures_per_episode": cfg.captures_per_episode,
+            "camera": camera_name,
             "foreground_prim_paths": foreground_paths,
         }
     finally:
@@ -168,30 +181,61 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
         _release_cuda_memory()
 
 
-def _build_isp_pair(runtime, camera: str, pair_dir: Path, foreground_paths: list[str], rng: random.Random, cfg: OnlineConfig) -> bool:
-    """One ISP pair from one captured frame. Returns True if a pair was written."""
+def _pick_camera(env, requested: str | None) -> str:
+    if requested:
+        return requested
+    for name in _CAMERA_CANDIDATES:
+        if name in env.scene.sensors:
+            return name
+    raise RuntimeError(
+        f"None of {_CAMERA_CANDIDATES} found on env.scene.sensors. "
+        f"Available: {list(env.scene.sensors.keys())}"
+    )
 
-    frame = runtime.capture_frame(camera, rgb=True, segmentation=True)
-    target = frame["rgb"]
+
+def _unpack_rgb(obs, camera_name: str) -> np.ndarray | None:
+    """Pull a (H, W, 3) uint8 numpy array from the env's image observation."""
+
+    from robolab.core.observations.observation_utils import unpack_image_obs
+
+    images = unpack_image_obs(obs, obs_group_name="image_obs", camera_suffix="_camera")
+    rgb = images.get(camera_name)
+    if rgb is None and camera_name.endswith("_camera"):
+        rgb = images.get(camera_name[: -len("_camera")])
+    if rgb is None:
+        return None
+    arr = np.asarray(rgb)
+    if arr.ndim == 4:
+        arr = arr[0]
+    if arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    return arr.astype(np.uint8, copy=False)
+
+
+def _capture_steps(num_steps: int, captures: int) -> set[int]:
+    captures = max(1, min(captures, num_steps))
+    # Cluster captures away from the very start — first few frames are visually
+    # identical to the reset state. Quartile-onward placement is fine.
+    start = max(1, num_steps // 6)
+    end = num_steps - 1
+    return set(int(round(s)) for s in np.linspace(start, end, num=captures))
+
+
+def _build_isp_pair(target: np.ndarray, mask: np.ndarray, pair_dir: Path, rng: random.Random, cfg: OnlineConfig, camera_name: str) -> bool:
     use_full_frame = cfg.isp_full_frame_fraction > 0.0 and rng.random() < cfg.isp_full_frame_fraction
     params = sample_isp_params(rng, scale=0.3 if use_full_frame else cfg.isp_strength)
     isp = apply_software_isp(target, params, rng)
-
     if use_full_frame:
-        mask = np.ones(target.shape[:2], dtype=np.float32)
+        m = np.ones(target.shape[:2], dtype=np.float32)
         mode = "full_frame_mild"
     else:
-        mask, mask_source = foreground_mask_with_fallback(
-            frame["segmentation"], frame["segmentation_mapping"] or {}, foreground_paths,
-        )
         if float(np.mean(mask > 0.05)) < 0.002:
             return False
-        mask = feather_mask(mask, sigma=3.0)
-        mode = mask_source
-
+        m = mask
+        mode = "masked_foreground"
     mixed = (
-        mask[..., None] * isp.astype(np.float32)
-        + (1.0 - mask[..., None]) * target.astype(np.float32)
+        m[..., None] * isp.astype(np.float32)
+        + (1.0 - m[..., None]) * target.astype(np.float32)
     ).astype(np.uint8)
     save_png(pair_dir / "isp_full.png", isp)
     write_pair(
@@ -199,52 +243,33 @@ def _build_isp_pair(runtime, camera: str, pair_dir: Path, foreground_paths: list
         {
             "component": "isp_modification",
             "mode": mode,
-            "camera": camera,
+            "camera": camera_name,
             "params": params.__dict__,
-            "mask_coverage": float(np.mean(mask > 0.05)),
-            "foreground_prim_paths": foreground_paths,
+            "mask_coverage": float(np.mean(m > 0.05)),
         },
-        mask=mask,
+        mask=m,
     )
     return True
 
 
-def _build_shadow_pair(runtime, camera: str, pair_dir: Path, foreground_paths: list[str], cfg: OnlineConfig) -> bool:
-    """One shadow pair from one frame: capture target, toggle shadowLink, capture no_shadow_fg."""
-
-    target = runtime.capture_frame(camera, rgb=True, segmentation=True)
-    runtime.set_shadow_link_excludes(foreground_paths, enabled=True)
-    try:
-        no_shadow = runtime.capture_frame(camera, rgb=True)
-    finally:
-        runtime.set_shadow_link_excludes(foreground_paths, enabled=False)
-
-    target_rgb = target["rgb"]
-    no_shadow_rgb = no_shadow["rgb"]
-    fg_mask, mask_source = foreground_mask_with_fallback(
-        target["segmentation"], target["segmentation_mapping"] or {}, foreground_paths,
-    )
-
-    diff = np.abs(target_rgb.astype(np.int16) - no_shadow_rgb.astype(np.int16)).astype(np.uint8)
+def _build_shadow_pair(target: np.ndarray, no_shadow: np.ndarray | None, fg_mask: np.ndarray, pair_dir: Path, cfg: OnlineConfig, camera_name: str) -> bool:
+    if no_shadow is None:
+        return False
+    diff = np.abs(target.astype(np.int16) - no_shadow.astype(np.int16)).astype(np.uint8)
     if float(np.mean(fg_mask > 0.05)) >= 0.002:
-        shadow_mask = _shadow_delta(target_rgb, no_shadow_rgb, _dilate(fg_mask))
+        shadow_mask = _shadow_delta(target, no_shadow, _dilate(fg_mask))
     else:
         shadow_mask = np.max(diff.astype(np.float32), axis=-1) / 255.0
-        mask_source = "shadow_delta_no_foreground_mask"
-
     if float(np.mean(shadow_mask > 0.03)) < cfg.shadow_min_coverage:
         return False
-
     save_png(pair_dir / "shadow_diff.png", diff)
     save_png(pair_dir / "shadow_mask.png", np.repeat((shadow_mask * 255).astype(np.uint8)[..., None], 3, axis=-1))
     write_pair(
-        pair_dir, no_shadow_rgb, target_rgb,
+        pair_dir, no_shadow, target,
         {
             "component": "shadow_simulation",
-            "camera": camera,
-            "mask_source": mask_source,
+            "camera": camera_name,
             "shadow_mask_coverage": float(np.mean(shadow_mask > 0.03)),
-            "foreground_prim_paths": foreground_paths,
         },
     )
     return True

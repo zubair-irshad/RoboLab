@@ -3,22 +3,18 @@
 # isort: skip_file
 """Online (per-trajectory) DiffusionHarmonizer pair generator.
 
-Modeled directly on ``examples/demo/run_empty.py``: launches Isaac Sim once,
-auto-registers tasks, and for each requested env runs N episodes × M
-sample-action steps. At every step we capture from 1-2 cameras and emit ISP
-+ shadow paired-data — paper Eq. (3) for ISP, target-vs-shadowLink-excluded
-delta for shadows.
-
-Use this for ISP / shadow / relighting (the components that benefit from
-trajectory diversity). Use ``capture_harmonizer_views.py`` for static
-100-camera sphere captures feeding the offline gsplat builders (artifacts +
-asset re-insertion).
+Modeled directly on ``examples/demo/run_empty.py``. Reuses the env's own
+camera (``over_shoulder_left_camera`` / ``external_cam`` / etc.) — no extra
+Replicator products on the stage. For each task: reset -> step N times with
+random sample-action commands; at K evenly-spaced steps capture an ISP pair
+(software-ISP + visibility-difference mask + Eq. 3 composite) and a shadow
+pair (target vs UsdLux.shadowLink-excluded re-render).
 
 Usage::
 
     PYTHONPATH=. python scripts/online_harmonizer_pairs.py \
         --task RubiksCubeAndBananaTask \
-        --num-cameras 2 --num-episodes 3 --num-steps 30 --spp 4
+        --num-episodes 2 --num-steps 30 --captures-per-episode 4
 """
 
 import argparse
@@ -37,18 +33,13 @@ parser.add_argument("--limit", type=int, default=None)
 parser.add_argument("--output-root", default="data/diffusion_harmonizer")
 parser.add_argument("--components", nargs="+", default=["isp_modification", "shadow_simulation"],
                     choices=("isp_modification", "shadow_simulation"))
-parser.add_argument("--num-cameras", type=int, default=2,
-                    help="Orbit-ring cameras placed around the workspace.")
-parser.add_argument("--camera-radius", type=float, default=1.6)
-parser.add_argument("--camera-center", type=float, nargs=3, default=(0.4, 0.0, 0.4))
-parser.add_argument("--camera-height", type=float, default=0.6)
-parser.add_argument("--capture-resolution", type=int, nargs=2, default=(512, 512))
-parser.add_argument("--spp", type=int, default=4)
 parser.add_argument("--num-episodes", type=int, default=3)
 parser.add_argument("--num-steps", type=int, default=30,
                     help="Sample-action steps per episode (matches run_empty.py default of 50).")
-parser.add_argument("--capture-every-n-steps", type=int, default=1,
-                    help="Skip-N-1 frames between captures to thin out highly correlated samples.")
+parser.add_argument("--captures-per-episode", type=int, default=4,
+                    help="How many evenly-spaced steps per episode produce paired data (2-5 recommended).")
+parser.add_argument("--camera", default=None,
+                    help="Override the camera name used for capture; default auto-picks from env.scene.sensors.")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--num-envs", type=int, default=1)
 parser.add_argument("--physx-buffer-scale", type=float, default=0.1)
@@ -91,15 +82,9 @@ def main() -> None:
 
     cfg = OnlineConfig(
         output_root=Path(args_cli.output_root),
-        num_cameras=args_cli.num_cameras,
-        camera_radius=args_cli.camera_radius,
-        camera_center=tuple(args_cli.camera_center),
-        camera_height=args_cli.camera_height,
-        capture_resolution=tuple(args_cli.capture_resolution),
-        spp=args_cli.spp,
         num_episodes=args_cli.num_episodes,
         num_steps_per_episode=args_cli.num_steps,
-        capture_every_n_steps=args_cli.capture_every_n_steps,
+        captures_per_episode=args_cli.captures_per_episode,
         seed=args_cli.seed,
         device=getattr(args_cli, "device", "cuda:0"),
         num_envs=args_cli.num_envs,
@@ -108,6 +93,7 @@ def main() -> None:
         isp_full_frame_fraction=args_cli.isp_full_frame_fraction,
         isp_strength=args_cli.isp_strength,
         shadow_min_coverage=args_cli.shadow_min_coverage,
+        camera_name=args_cli.camera,
     )
     print(f"[online] running on {len(env_names)} env(s) -> {cfg.output_root}", flush=True)
     summary = run_online(env_names, cfg)
