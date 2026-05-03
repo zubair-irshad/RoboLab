@@ -415,79 +415,241 @@ def _build_isp_pair(target: np.ndarray, mask: np.ndarray, pair_dir: Path, rng: r
 def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: OnlineConfig, env_name: str) -> None:
     """One-shot multi-view rgb+depth+camera matrix dump for offline gsplat.
 
-    The DIFIX3D+ artifacts-correction strategies (sparse_k / underfit / cycle
-    / cross_ref) need rgb + intrinsics + extrinsics across N hemispheric
-    views of a static scene. We do that here once per env, before the
-    trajectory loop touches anything, and write to disk:
+    Adapted from the DROID-ManipVerse orbit-capture pattern: reuse an
+    existing TiledCamera the env already owns and teleport it around the
+    scene via ``set_world_poses``. After each pose change we tick
+    ``env.sim.render()`` + ``env.scene.update(0)`` to refresh the camera's
+    own data buffer. No Replicator render products = no first-frame
+    warmup hang.
 
-      ``<output_dir>/views/<NNNN>/{rgb.png, depth.npy, intrinsics.json,
-      extrinsics.json}``
+    Camera positions cover the upper hemisphere via a Fibonacci spiral
+    (skipping exact poles) so the four DIFIX3D+ strategies have varied
+    train / hold-out splits.
 
-    The post-hoc ``scripts/build_artifacts_pairs.py`` reads these views and
-    runs the gsplat strategies; no Isaac Sim needed there.
+    Output: ``<output_dir>/views/<NNNN>/{rgb.png, depth.npy,
+    intrinsics.json, extrinsics.json}``.
     """
+
+    import time as _time
+    import torch
 
     output_dir.mkdir(parents=True, exist_ok=True)
     views_dir = output_dir / "views"
     views_dir.mkdir(parents=True, exist_ok=True)
 
+    # Pick the first available env-side camera to drive around the scene.
+    available = list(getattr(env.scene, "sensors", {}).keys())
+    cam_name = None
+    for candidate in _CAMERA_CANDIDATES:
+        if candidate in available:
+            cam_name = candidate
+            break
+    if cam_name is None:
+        print(
+            f"[online:{env_name}] hemispheric snapshot SKIPPED — no env camera "
+            f"available (sensors: {available})",
+            flush=True,
+        )
+        return
+    base_cam = env.scene[cam_name]
+    env_ids = torch.tensor([0], device=env.device, dtype=torch.long)
+
+    # Save original pose so trajectory captures see the same external_cam pose.
+    original_pos = base_cam.data.pos_w[0].clone()
+    original_quat = base_cam.data.quat_w_world[0].clone()
+
     print(
-        f"[online:{env_name}] hemispheric snapshot: {cfg.hemisphere_cameras} cameras "
-        f"radius={cfg.hemisphere_radius} spp={cfg.hemisphere_spp}",
+        f"[online:{env_name}] hemispheric snapshot via {cam_name}: "
+        f"{cfg.hemisphere_cameras} views radius={cfg.hemisphere_radius} spp={cfg.hemisphere_spp}",
         flush=True,
     )
 
-    # Settle the env so default joint positions & object resting state are stable.
     if cfg.hemisphere_settle_steps > 0:
         runtime.step(cfg.hemisphere_settle_steps)
 
-    cameras = runtime.add_sphere_cameras(
-        center=cfg.hemisphere_center,
-        radius=cfg.hemisphere_radius,
-        num_cameras=cfg.hemisphere_cameras,
-        resolution=cfg.hemisphere_resolution,
-        name_prefix=f"hemi_{env_name}",
-    )
     runtime.set_path_tracing(True, spp=cfg.hemisphere_spp)
     _kit_update()
 
-    manifest_views = []
-    import time as _time
+    center = np.asarray(cfg.hemisphere_center, dtype=np.float64)
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    eyes = _fibonacci_hemisphere_eyes(cfg.hemisphere_cameras, cfg.hemisphere_radius, center)
 
+    manifest_views = []
     t0 = _time.time()
-    for idx, cam in enumerate(cameras):
-        frame = runtime.capture_frame(cam, rgb=True, depth=True)
-        view_dir = views_dir / f"{idx:04d}"
-        view_dir.mkdir(parents=True, exist_ok=True)
-        save_png(view_dir / "rgb.png", frame["rgb"])
-        if frame.get("depth") is not None:
-            np.save(view_dir / "depth.npy", frame["depth"])
-        save_json(view_dir / "intrinsics.json", {"K": frame["camera_intrinsics"].tolist()})
-        save_json(view_dir / "extrinsics.json", {"world_T_cam_gl": frame["camera_extrinsics"].tolist()})
-        manifest_views.append({"view_id": idx, "dir": str(view_dir.relative_to(output_dir))})
-        if (idx + 1) % 10 == 0:
-            elapsed = _time.time() - t0
-            rate = (idx + 1) / max(elapsed, 1e-3)
-            print(
-                f"[online:{env_name}]   hemi {idx + 1}/{len(cameras)} ({rate:.2f} fps)",
-                flush=True,
+    try:
+        for idx, eye in enumerate(eyes):
+            quat_wxyz = _look_at_quat_opengl(eye, center, up)
+            pos_t = torch.tensor(eye, device=env.device, dtype=torch.float32).unsqueeze(0)
+            quat_t = torch.tensor(quat_wxyz, device=env.device, dtype=torch.float32).unsqueeze(0)
+            base_cam.set_world_poses(
+                positions=pos_t, orientations=quat_t, env_ids=env_ids, convention="opengl",
             )
+
+            # Force the renderer + sensor data to refresh at the new pose
+            # without advancing physics.
+            env.sim.render()
+            env.scene.update(0.0)
+
+            out = base_cam.data.output
+            rgb_t = out.get("rgb")
+            if rgb_t is None:
+                print(
+                    f"[online:{env_name}]   view {idx} rgb missing on {cam_name}; skipping",
+                    flush=True,
+                )
+                continue
+            rgb = rgb_t[0].detach().cpu().numpy()
+            if rgb.ndim == 3 and rgb.shape[-1] == 4:
+                rgb = rgb[..., :3]
+            if rgb.dtype != np.uint8:
+                if float(rgb.max()) <= 1.0 + 1e-6:
+                    rgb = rgb * 255.0
+                rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+            depth_arr = None
+            depth_t = out.get("distance_to_image_plane") or out.get("depth")
+            if depth_t is not None:
+                depth_arr = depth_t[0].detach().cpu().numpy().astype(np.float32).squeeze()
+
+            K = base_cam.data.intrinsic_matrices[0].detach().cpu().numpy().astype(np.float32)
+            world_T_cam = _build_world_T_cam(
+                base_cam.data.pos_w[0].detach().cpu().numpy(),
+                base_cam.data.quat_w_world[0].detach().cpu().numpy(),
+            )
+
+            view_dir = views_dir / f"{idx:04d}"
+            view_dir.mkdir(parents=True, exist_ok=True)
+            save_png(view_dir / "rgb.png", rgb)
+            if depth_arr is not None:
+                np.save(view_dir / "depth.npy", depth_arr)
+            save_json(view_dir / "intrinsics.json", {"K": K.tolist()})
+            save_json(view_dir / "extrinsics.json", {"world_T_cam_gl": world_T_cam.tolist()})
+            manifest_views.append({"view_id": idx, "dir": str(view_dir.relative_to(output_dir))})
+
+            if (idx + 1) % 10 == 0:
+                elapsed = _time.time() - t0
+                rate = (idx + 1) / max(elapsed, 1e-3)
+                print(
+                    f"[online:{env_name}]   hemi {idx + 1}/{len(eyes)} ({rate:.2f} fps)",
+                    flush=True,
+                )
+    finally:
+        # Restore the env-side camera so the trajectory captures use the same
+        # pose the task / image_obs was configured with.
+        base_cam.set_world_poses(
+            positions=original_pos.unsqueeze(0),
+            orientations=original_quat.unsqueeze(0),
+            env_ids=env_ids,
+            convention="opengl",
+        )
+        env.sim.render()
+        env.scene.update(0.0)
+        runtime.set_path_tracing(False)
 
     save_json(
         output_dir / "manifest.json",
         {
             "env_name": env_name,
-            "num_views": len(cameras),
+            "driving_camera": cam_name,
+            "num_views": len(manifest_views),
             "resolution": list(cfg.hemisphere_resolution),
             "spp": cfg.hemisphere_spp,
+            "center": list(cfg.hemisphere_center),
+            "radius": cfg.hemisphere_radius,
             "views": manifest_views,
         },
     )
-    runtime.set_path_tracing(False)
     print(
-        f"[online:{env_name}] hemispheric snapshot done in {_time.time() - t0:.1f}s",
+        f"[online:{env_name}] hemispheric snapshot done in {_time.time() - t0:.1f}s "
+        f"({len(manifest_views)} views written)",
         flush=True,
     )
+
+
+def _fibonacci_hemisphere_eyes(num: int, radius: float, center: np.ndarray) -> np.ndarray:
+    """Fibonacci spiral over the upper hemisphere (z >= 0 in world frame).
+
+    Pinches off the exact zenith / equator (z in [0.05, 0.95]) so the
+    look-at quaternion stays well-conditioned and views don't peer along
+    the up vector.
+    """
+
+    golden = np.pi * (3.0 - np.sqrt(5.0))
+    pts = []
+    for i in range(num):
+        z = 0.05 + 0.9 * (i / max(num - 1, 1))
+        r = np.sqrt(max(0.0, 1.0 - z * z))
+        theta = golden * i
+        x = r * np.cos(theta)
+        y = r * np.sin(theta)
+        pts.append(center + radius * np.array([x, y, z], dtype=np.float64))
+    return np.stack(pts, axis=0)
+
+
+def _look_at_quat_opengl(eye, target, up):
+    """OpenGL-convention (camera looks down -Z, +Y up) wxyz quaternion."""
+
+    eye = np.asarray(eye, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    up = np.asarray(up, dtype=np.float64)
+    f = target - eye
+    f /= np.linalg.norm(f) + 1e-12
+    r = np.cross(f, up)
+    r /= np.linalg.norm(r) + 1e-12
+    u = np.cross(r, f)
+    R = np.stack([r, u, -f], axis=1)
+
+    t = R.trace()
+    if t > 0:
+        s = 0.5 / np.sqrt(t + 1.0)
+        w = 0.25 / s
+        x = (R[2, 1] - R[1, 2]) * s
+        y = (R[0, 2] - R[2, 0]) * s
+        z = (R[1, 0] - R[0, 1]) * s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    q = np.array([w, x, y, z], dtype=np.float64)
+    q /= np.linalg.norm(q)
+    return q
+
+
+def _build_world_T_cam(pos: np.ndarray, quat_wxyz: np.ndarray) -> np.ndarray:
+    """Compose a (4, 4) world-from-camera transform from translation + quat."""
+
+    w, x, y, z = float(quat_wxyz[0]), float(quat_wxyz[1]), float(quat_wxyz[2]), float(quat_wxyz[3])
+    n = (w * w + x * x + y * y + z * z) ** 0.5
+    if n < 1e-9:
+        R = np.eye(3, dtype=np.float64)
+    else:
+        w, x, y, z = w / n, x / n, y / n, z / n
+        R = np.array(
+            [
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ],
+            dtype=np.float64,
+        )
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = np.asarray(pos, dtype=np.float64).reshape(3)
+    return T
 
 
 def _build_shadow_pair(target: np.ndarray, no_shadow: np.ndarray | None, fg_mask: np.ndarray, pair_dir: Path, cfg: OnlineConfig, camera_name: str) -> bool:
