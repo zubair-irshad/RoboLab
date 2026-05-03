@@ -236,6 +236,13 @@ def _render_single(view: CapturedView, params: dict, cfg: GSplatConfig, bg_color
     cam_T_world = torch.tensor(np.linalg.inv(opengl_to_opencv(view.world_T_cam)), dtype=torch.float32, device=params["means"].device).unsqueeze(0)
 
     colors = torch.cat([params["sh0"], params["shN"]], dim=1)
+    # gsplat 1.5.x's rasterize_to_pixels asserts backgrounds.shape ==
+    # (C, H, W, channels) — i.e. one background colour per pixel — instead of
+    # the older (C, channels) per-image colour. Either expand the constant
+    # bg to a full (1, H, W, 3) tensor or just omit it; omitting is cheaper
+    # and gives alpha-composited renders, which our L1+SSIM loss handles
+    # correctly because the target rgbs are themselves natively composited.
+    del bg_color
     rendered, alpha, info = rasterization(
         means=params["means"],
         quats=params["quats"],
@@ -247,7 +254,6 @@ def _render_single(view: CapturedView, params: dict, cfg: GSplatConfig, bg_color
         width=width,
         height=height,
         sh_degree=cfg.sh_degree,
-        backgrounds=bg_color.unsqueeze(0),
         rasterize_mode=rasterize_mode,
     )
     return rendered[0], alpha[0], info
