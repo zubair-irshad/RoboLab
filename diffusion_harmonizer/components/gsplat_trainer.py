@@ -200,33 +200,47 @@ def train_and_render(
 
     rasterize_mode = "antialiased" if cfg.splat_kind == "3dgs" else "RGB+ED"
     bg_color = torch.tensor(cfg.background, dtype=torch.float32, device=params["means"].device)
+    # Match gsplat's reference simple_trainer.py: explicit packed=False so
+    # info["radii"] / info["means2d"] are 2D [C, N] instead of 1D [nnz],
+    # which is what DefaultStrategy._update_state assumes.
+    packed = False
 
     for step in range(cfg.iterations):
         view = views[train_indices[step % len(train_indices)]]
         target = torch.tensor(view.rgb, dtype=torch.float32, device=params["means"].device) / 255.0
-        rendered, alpha, info = _render_single(view, params, cfg, bg_color, rasterize_mode)
-        loss = (rendered - target).abs().mean() + 0.1 * (1.0 - _ssim(rendered, target))
         for opt in optimizers.values():
             opt.zero_grad(set_to_none=True)
+        rendered, alpha, info = _render_single(view, params, cfg, bg_color, rasterize_mode, packed=packed)
+        # gsplat's DefaultStrategy needs gradients on info["means2d"] for
+        # the densification heuristic. retain_grad() so loss.backward()
+        # populates info["means2d"].grad even though it's a non-leaf.
+        if "means2d" in info and info["means2d"].requires_grad:
+            info["means2d"].retain_grad()
+        loss = (rendered - target).abs().mean() + 0.1 * (1.0 - _ssim(rendered, target))
         if strategy is not None:
-            strategy.step_pre_backward(params, optimizers, strategy_state, step, info)
+            strategy.step_pre_backward(
+                params=params, optimizers=optimizers, state=strategy_state, step=step, info=info,
+            )
         loss.backward()
         for opt in optimizers.values():
             opt.step()
         if strategy is not None:
-            strategy.step_post_backward(params, optimizers, strategy_state, step, info)
+            strategy.step_post_backward(
+                params=params, optimizers=optimizers, state=strategy_state, step=step, info=info,
+                packed=packed,
+            )
         if progress_cb and step % 200 == 0:
             progress_cb(step, float(loss.detach().cpu()))
 
     rendered_per_view: dict[int, np.ndarray] = {}
     with torch.no_grad():
         for idx in render_indices:
-            rgb, _alpha, _info = _render_single(views[idx], params, cfg, bg_color, rasterize_mode)
+            rgb, _alpha, _info = _render_single(views[idx], params, cfg, bg_color, rasterize_mode, packed=packed)
             rendered_per_view[idx] = (rgb.clamp(0.0, 1.0).cpu().numpy() * 255.0).astype(np.uint8)
     return rendered_per_view
 
 
-def _render_single(view: CapturedView, params: dict, cfg: GSplatConfig, bg_color, rasterize_mode):
+def _render_single(view: CapturedView, params: dict, cfg: GSplatConfig, bg_color, rasterize_mode, packed: bool = False):
     import torch
     from gsplat import rasterization
 
@@ -237,11 +251,10 @@ def _render_single(view: CapturedView, params: dict, cfg: GSplatConfig, bg_color
 
     colors = torch.cat([params["sh0"], params["shN"]], dim=1)
     # gsplat 1.5.x's rasterize_to_pixels asserts backgrounds.shape ==
-    # (C, H, W, channels) — i.e. one background colour per pixel — instead of
-    # the older (C, channels) per-image colour. Either expand the constant
-    # bg to a full (1, H, W, 3) tensor or just omit it; omitting is cheaper
-    # and gives alpha-composited renders, which our L1+SSIM loss handles
-    # correctly because the target rgbs are themselves natively composited.
+    # (C, H, W, channels) — per-pixel — instead of the older per-image
+    # (C, channels). Omit ``backgrounds`` so gsplat returns alpha-composited
+    # renders; our L1+SSIM loss handles that since the target rgbs are
+    # already natively alpha-composited.
     del bg_color
     rendered, alpha, info = rasterization(
         means=params["means"],
@@ -255,6 +268,7 @@ def _render_single(view: CapturedView, params: dict, cfg: GSplatConfig, bg_color
         height=height,
         sh_degree=cfg.sh_degree,
         rasterize_mode=rasterize_mode,
+        packed=packed,
     )
     return rendered[0], alpha[0], info
 
