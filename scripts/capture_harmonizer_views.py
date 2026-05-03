@@ -1,18 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: CC-BY-NC-4.0
 # isort: skip_file
-"""Capture phase only - run Isaac Sim, dump every variant the post-hoc builders need.
+"""Static-scene 100-camera sphere capture for the OFFLINE gsplat builders.
+
+Use this **only** for the artifacts-correction and asset-reinsertion paths
+(both need a static scene + privileged 100-view capture for gsplat training).
+ISP / shadow / relighting do NOT come through here — those are generated
+online per-trajectory by ``scripts/online_harmonizer_pairs.py``.
 
 For each requested env this script captures, per spherical camera, up to four
 rgb variants plus mask + depth + camera matrices, and writes them under
-``data/captures/<env>/sphere/<NNNN>/``. Once finished, Isaac Sim shuts down and
-``scripts/build_harmonizer_pairs.py`` consumes the disk capture without ever
-needing the simulator again.
+``data/captures/<env>/sphere/<NNNN>/``. Once finished, Isaac Sim shuts down
+and the offline gsplat builders (coming next) consume the disk capture.
 
 Usage::
 
     PYTHONPATH=. python scripts/capture_harmonizer_views.py --task RubiksCubeAndBananaTask \
-        --num-sphere-cameras 30 --spp 4 --variants target no_shadow_fg
+        --num-sphere-cameras 100 --spp 16 --variants target bg_only
 """
 
 import argparse
