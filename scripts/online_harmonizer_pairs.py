@@ -51,6 +51,12 @@ parser.add_argument("--spp", type=int, default=8,
                     help="Path-tracing samples per pixel during capture. Lower = faster but noisier shadows.")
 parser.add_argument("--no-path-tracing", dest="use_path_tracing", action="store_false", default=True,
                     help="Skip path tracing during capture. Shadows will not visibly toggle in the rasterizer.")
+parser.add_argument("--playback-data-root", default="examples/demo/recorded_data",
+                    help="Where to find <task>/data.hdf5 demos to replay (matches run_recorded.py). "
+                         "When present, the robot follows recorded feasible trajectories instead of "
+                         "chasing random sample-space targets.")
+parser.add_argument("--no-playback", dest="playback_disabled", action="store_true", default=False,
+                    help="Force fallback to sample_space even if HDF5 demos exist.")
 parser.add_argument("--sun-intensity-range", type=float, nargs=2, default=(1500.0, 4000.0))
 parser.add_argument("--sun-angle-deg-range", type=float, nargs=2, default=(1.0, 6.0))
 parser.add_argument("--seed", type=int, default=42)
@@ -111,6 +117,7 @@ def main() -> None:
         sun_angle_deg_range=tuple(args_cli.sun_angle_deg_range),
         use_path_tracing=args_cli.use_path_tracing,
         spp=args_cli.spp,
+        playback_data_root=None if args_cli.playback_disabled else Path(args_cli.playback_data_root),
     )
     print(f"[online] running on {len(env_names)} env(s) -> {cfg.output_root}", flush=True)
     summary = run_online(env_names, cfg)

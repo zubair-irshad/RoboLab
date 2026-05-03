@@ -95,8 +95,12 @@ def apply_software_isp(image: np.ndarray, params: ISPParams, rng: random.Random 
     lin *= wb / max(float(np.mean(wb)), 1e-6)
     srgb = linear_to_srgb(lin).astype(np.float32) / 255.0
 
+    # OpenCV's float HSV uses H in [0, 360), not the uint8 [0, 180) convention.
+    # The previous code wrapped with % 180.0, which silently rotated every
+    # pixel with original hue >= 180 (cyans / blues / magentas) by 180°
+    # to its complementary color — independent of the hue_shift value.
     hsv = cv2.cvtColor(srgb, cv2.COLOR_RGB2HSV)
-    hsv[..., 0] = (hsv[..., 0] + params.hue_shift / 2.0) % 180.0
+    hsv[..., 0] = (hsv[..., 0] + params.hue_shift) % 360.0
     hsv[..., 1] = np.clip(hsv[..., 1] * params.saturation, 0.0, 1.0)
     srgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
     srgb = np.clip((srgb - 0.5) * params.contrast + 0.5, 0.0, 1.0)

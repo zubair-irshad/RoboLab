@@ -85,6 +85,10 @@ class OnlineConfig:
     use_path_tracing: bool = True
     spp: int = 8
     cameras: tuple[str, ...] | None = None
+    # When set, replay actions from this directory's per-task HDF5 demos
+    # (matches examples/demo/run_recorded.py). Gives smooth feasible
+    # robot trajectories instead of clamped-at-joint-limits flailing.
+    playback_data_root: Path | None = Path("examples/demo/recorded_data")
 
 
 def run_online(env_names: list[str], cfg: OnlineConfig) -> dict:
@@ -109,6 +113,7 @@ def run_online(env_names: list[str], cfg: OnlineConfig) -> dict:
 
 
 def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
+    import torch
     from isaaclab.envs.utils.spaces import sample_space
 
     env_dir = cfg.output_root / env_name
@@ -139,6 +144,19 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
             runtime.set_path_tracing(True, spp=cfg.spp)
             print(f"[online:{env_name}] path tracing ENABLED (spp={cfg.spp})", flush=True)
 
+        playback_actions = _load_playback_actions(env_name, cfg.playback_data_root, cfg.num_episodes)
+        if playback_actions:
+            print(
+                f"[online:{env_name}] playback: {len(playback_actions)} demo episode(s), "
+                f"length(s)={[len(a) for a in playback_actions]}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[online:{env_name}] playback: NONE (falling back to sample_space + action_hold_steps)",
+                flush=True,
+            )
+
         rng = random.Random(cfg.seed)
         isp_count = 0
         shadow_count = 0
@@ -156,14 +174,30 @@ def _run_env_online(env_name: str, cfg: OnlineConfig) -> dict:
             )
 
             obs, _ = env.reset()
-            capture_steps = _capture_steps(cfg.num_steps_per_episode, cfg.captures_per_episode)
+            episode_actions = (
+                playback_actions[episode % len(playback_actions)] if playback_actions else None
+            )
+            num_steps = (
+                min(cfg.num_steps_per_episode, len(episode_actions))
+                if episode_actions is not None
+                else cfg.num_steps_per_episode
+            )
+            capture_steps = _capture_steps(num_steps, cfg.captures_per_episode)
 
             held_actions = None
-            for step in range(cfg.num_steps_per_episode):
-                if held_actions is None or step % max(1, cfg.action_hold_steps) == 0:
-                    held_actions = sample_space(
-                        env.single_action_space, device=env.device, batch_size=env.num_envs
+            for step in range(num_steps):
+                if episode_actions is not None:
+                    actions_np = episode_actions[step]
+                    held_actions = (
+                        torch.tensor(actions_np, device=env.device, dtype=torch.float32)
+                        .unsqueeze(0)
+                        .repeat(env.num_envs, 1)
                     )
+                else:
+                    if held_actions is None or step % max(1, cfg.action_hold_steps) == 0:
+                        held_actions = sample_space(
+                            env.single_action_space, device=env.device, batch_size=env.num_envs
+                        )
                 obs, _, _, _, _ = env.step(held_actions)
 
                 if step not in capture_steps:
@@ -339,6 +373,35 @@ def _dilate(mask: np.ndarray, pixels: int = 7) -> np.ndarray:
 def _shadow_delta(target: np.ndarray, no_shadow: np.ndarray, fg_dilated: np.ndarray) -> np.ndarray:
     diff = np.max(np.abs(target.astype(np.float32) - no_shadow.astype(np.float32)), axis=-1) / 255.0
     return np.clip(diff * (1.0 - np.clip(fg_dilated, 0.0, 1.0)), 0.0, 1.0)
+
+
+def _load_playback_actions(env_name: str, root: Path | None, num_episodes: int) -> list[np.ndarray]:
+    """Load up to ``num_episodes`` HDF5 demo trajectories for ``env_name``.
+
+    Looks under ``<root>/<env_name>/data.hdf5`` (matches the layout
+    ``examples/demo/run_recorded.py`` consumes). Returns a list of
+    ``(num_steps, action_dim)`` numpy arrays; empty list if no demos.
+    """
+
+    if root is None:
+        return []
+    hdf5_path = Path(root) / env_name / "data.hdf5"
+    if not hdf5_path.exists():
+        return []
+    try:
+        from robolab.core.utils.file_utils import load_hdf5_episode_data
+    except Exception:
+        return []
+    actions: list[np.ndarray] = []
+    for episode in range(num_episodes):
+        try:
+            arr = load_hdf5_episode_data(str(hdf5_path), episode, "actions")
+        except Exception:
+            break
+        if arr is None or len(arr) == 0:
+            break
+        actions.append(np.asarray(arr))
+    return actions
 
 
 def _kit_update() -> None:
