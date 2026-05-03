@@ -50,9 +50,20 @@ def linear_to_srgb(image: np.ndarray) -> np.ndarray:
 
 
 def sample_isp_params(rng: random.Random, scale: float = 1.0) -> ISPParams:
+    """All knobs modulated by ``scale``, including white balance.
+
+    The previous version always sampled WB from the full 3000-8000 K span
+    even at low ``scale``, which alone flipped object color identity (a teal
+    bowl rendered as red). We anchor at D65 (~5500 K) and let ``scale`` drive
+    the half-width of the WB sweep, so ``scale=0.3`` gives ±750 K — paper-
+    like subtle warm/cool drift rather than a full white-balance reversal.
+    """
+
+    wb_center = 5500
+    wb_halfwidth = int(2500 * scale)
     return ISPParams(
         exposure_ev=rng.uniform(-1.5, 1.5) * scale,
-        white_balance_K=int(rng.uniform(3000, 8000)),
+        white_balance_K=int(wb_center + rng.uniform(-wb_halfwidth, wb_halfwidth)),
         gamma=1.0 + (rng.uniform(0.6, 1.8) - 1.0) * scale,
         saturation=1.0 + (rng.uniform(0.5, 1.5) - 1.0) * scale,
         contrast=1.0 + (rng.uniform(0.7, 1.3) - 1.0) * scale,

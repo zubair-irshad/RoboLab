@@ -72,9 +72,9 @@ class OnlineConfig:
     physx_buffer_scale: float = 0.1
     components: tuple[str, ...] = ("isp_modification", "shadow_simulation")
     isp_full_frame_fraction: float = 0.0
-    # 0.3 ≈ ±0.45 EV, ±15% saturation, ±5° hue, ±0.25 gamma — paper-like subtle
-    # tone mismatch rather than a wholesale color swap.
-    isp_strength: float = 0.3
+    # 0.25 ≈ ±0.4 EV, ±12% saturation, ±4° hue, ±0.2 gamma, ±625 K WB —
+    # paper-like subtle tone mismatch (object identity preserved).
+    isp_strength: float = 0.25
     shadow_min_coverage: float = 0.0008
     # Per-episode randomized sun for visible cast shadows. Smaller angular size
     # = sharper shadow edges; higher intensity = stronger contrast vs the dome.

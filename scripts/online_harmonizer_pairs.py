@@ -44,9 +44,9 @@ parser.add_argument("--cameras", nargs="+", default=None,
 parser.add_argument("--action-hold-steps", type=int, default=10,
                     help="Hold each sampled action this many physics steps so the PD controller actually tracks it. "
                          "0 or 1 = re-sample every step (robot chases unreachable targets and barely moves).")
-parser.add_argument("--isp-strength", type=float, default=0.3,
-                    help="ISP perturbation magnitude (0 = identity, 1 = aggressive). Paper-faithful ~0.3 produces "
-                         "subtle tone mismatch; >0.6 produces unrealistic full color swaps.")
+parser.add_argument("--isp-strength", type=float, default=0.25,
+                    help="ISP perturbation magnitude (0 = identity, 1 = aggressive). Paper-faithful ~0.25 produces "
+                         "subtle tone mismatch (object identity preserved); >0.5 starts swapping object color.")
 parser.add_argument("--spp", type=int, default=8,
                     help="Path-tracing samples per pixel during capture. Lower = faster but noisier shadows.")
 parser.add_argument("--no-path-tracing", dest="use_path_tracing", action="store_false", default=True,
