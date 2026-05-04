@@ -167,14 +167,24 @@ def export_env(
     images_pool = output_dir / "images"
     _stage_image_pool(views, images_pool)
 
-    rng = random.Random(seed)
-    all_ids = [v["view_id"] for v in views]
-    sparse_ids = sorted(rng.sample(all_ids, k=min(sparse_k, len(all_ids))))
-    even_ids = [vid for vid in all_ids if vid % 2 == 0]
-    odd_ids = [vid for vid in all_ids if vid % 2 == 1]
-    half = len(all_ids) // 2
-    first_half = all_ids[:half]
-    second_half = all_ids[half:]
+    del seed  # kept for backward compat; we now pick spatially deterministic subsets
+    all_ids = sorted(v["view_id"] for v in views)
+    n = len(all_ids)
+    k = min(max(1, sparse_k), n)
+    # Equally-spaced sparse: every (n/k)-th view of the Fibonacci spiral.
+    # Deterministic and gives the same hemispheric coverage as random sampling
+    # but with predictable spacing.
+    spaced_indices = [int(round(i * (n - 1) / max(k - 1, 1))) for i in range(k)]
+    sparse_ids = sorted({all_ids[i] for i in spaced_indices})
+    sparse_eval_ids = [vid for vid in all_ids if vid not in set(sparse_ids)]
+    # Contiguous-arc holdout: training views form a continuous block of the
+    # Fibonacci spiral (which traces a connected hemispheric path), so the
+    # held-out indices sit on a completely different angular sector and
+    # splatfacto genuinely has to extrapolate — gives much stronger
+    # paired-data signal on overlapping-view datasets per the DIFIX3D+
+    # paper's note about sparse reconstruction.
+    arc_ids = all_ids[: max(1, n // 3)]  # first third of the spiral as train
+    arc_eval_ids = all_ids[n // 3 :]
 
     strategies: list[StrategyExport] = []
 
@@ -197,11 +207,6 @@ def export_env(
             )
         )
 
-    # The two paper strategies that map cleanly onto hemispheric Fibonacci
-    # captures. cycle / cross_ref were designed for temporal driving
-    # sequences; on a static-scene spiral they reduce to weaker forms of
-    # sparse_k, so we skip them.
-    del even_ids, odd_ids, first_half, second_half  # noqa: F821 (kept above for parity)
     write_variant(
         "full",
         views,
@@ -212,13 +217,30 @@ def export_env(
     )
     write_variant(
         "sparse_k",
-        views,  # all frames go in transforms.json
+        views,  # all frames in transforms.json; train_filenames picks the subset
         train_ids=sparse_ids,
-        eval_ids=[vid for vid in all_ids if vid not in set(sparse_ids)],
+        eval_ids=sparse_eval_ids,
         note=(
-            f"{len(sparse_ids)} of {len(views)} views as train_filenames, the rest as "
-            f"eval_filenames. The trained model has blurred / hole-y novel-view renders "
-            f"at the held-out poses — exactly the DIFIX3D+ sparse-reconstruction signature."
+            f"{len(sparse_ids)} equally-spaced views from the Fibonacci spiral as "
+            f"train_filenames; remaining {len(sparse_eval_ids)} as eval_filenames. "
+            "WARNING: per DIFIX3D+ §3.2, sparse reconstruction is suboptimal when "
+            "held-out views observe the same region as training views — which is the "
+            "case here on a tightly-sampled hemisphere. Use sparse_arc instead for "
+            "stronger paired-data signal."
+        ),
+        ns_train_args="splatfacto --max-num-iterations 30000",
+    )
+    write_variant(
+        "sparse_arc",
+        views,
+        train_ids=arc_ids,
+        eval_ids=arc_eval_ids,
+        note=(
+            f"Train on the first {len(arc_ids)} contiguous views of the Fibonacci "
+            f"spiral; render the remaining {len(arc_eval_ids)} as held-out. The held-"
+            "out views sit on a different angular sector of the hemisphere, so "
+            "splatfacto cannot interpolate them well — strong DIFIX3D+ sparse-"
+            "reconstruction supervision signal even on overlapping-view captures."
         ),
         ns_train_args="splatfacto --max-num-iterations 30000",
     )

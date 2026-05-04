@@ -47,8 +47,10 @@ def parse_args() -> argparse.Namespace:
                         help="Path to the per-env nerfstudio dir (contains full/, sparse_k/, ...).")
     parser.add_argument("--output-dir", required=True, type=Path,
                         help="Where pair subdirs (0000/, 0001/, ...) are written.")
-    parser.add_argument("--strategies", nargs="+", default=("sparse_k", "underfit"),
-                        help="Degraded strategies to pair with the reference 'full' renders.")
+    parser.add_argument("--strategies", nargs="+", default=("sparse_arc", "underfit"),
+                        help="Degraded strategies to pair with the reference 'full' renders. "
+                             "sparse_arc is preferred for hemispheric captures (held-out views "
+                             "are geometrically separated). sparse_k is a weak alternative.")
     parser.add_argument("--reference", default="full",
                         help="Reference (clean) strategy name; defaults to 'full'.")
     parser.add_argument("--renders-subdir", default="renders",
