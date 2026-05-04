@@ -166,7 +166,12 @@ def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: ArtifactCaptureCo
                 rgb = np.clip(rgb, 0, 255).astype(np.uint8)
 
             depth_arr = None
-            depth_t = out.get("distance_to_image_plane") or out.get("depth")
+            # ``a or b`` evaluates ``bool(a)``; for multi-element tensors that
+            # raises "Boolean value of Tensor with more than one value is
+            # ambiguous". Walk the candidates explicitly with ``is not None``.
+            depth_t = out.get("distance_to_image_plane")
+            if depth_t is None:
+                depth_t = out.get("depth")
             if depth_t is not None:
                 depth_arr = depth_t[0].detach().cpu().numpy().astype(np.float32).squeeze()
 
