@@ -20,11 +20,12 @@ once via ``isaaclab.app.AppLauncher`` and the orchestrator runs inside.
 
 from __future__ import annotations
 
+import random
 import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from diffusion_harmonizer.components import (
     artifacts_correction,
@@ -67,6 +68,10 @@ class PipelineConfig:
         "asset_reinsertion",
     )
     hdri_roots: tuple[str, ...] = ("assets/backgrounds/indoors", "assets/backgrounds/default")
+    # Marble (3D) scenes referenced as the visible background instead of dome
+    # HDRIs, to test the hypothesis that latlong HDR projection hurts
+    # background rendering quality. Set to () to disable and fall back to HDRI.
+    marble_scene_roots: tuple[str, ...] = ("assets/scenes/marble",)
     preview_cameras: tuple[tuple[tuple[float, float, float], tuple[float, float, float]], ...] = field(
         default_factory=lambda: (
             ((1.6, -1.2, 1.2), (0.4, 0.0, 0.5)),
@@ -201,19 +206,34 @@ def _run_env(env_name: str, cfg: PipelineConfig) -> dict[str, Any]:
         captured_views = None
         if "artifacts_correction" in cfg.components:
             print(f"[pipeline:{env_name}] >>> 01_artifacts_correction", flush=True)
-            captured_views = artifacts_correction.capture_sphere_views(runtime, sphere_cameras, spp=cfg.spp)
-            entries = artifacts_correction.generate_pairs(
-                runtime,
-                cameras=sphere_cameras,
-                output_dir=env_dir / "01_artifacts_correction",
-                count=cfg.artifacts_pairs_per_env,
-                full_iterations=cfg.full_iterations,
-                splat_kind=cfg.splat_kind,
-                seed=cfg.seed,
-                spp=cfg.spp,
-                captured_views=captured_views,
-            )
-            summary["components"]["artifacts_correction"] = {"num_pairs": len(entries)}
+            # Marble background only applies here: the hypothesis being tested
+            # is that latlong HDR backgrounds hurt artifacts-correction render
+            # quality. Other components keep the dome HDRI background.
+            marble_scenes = _gather_marble_scenes(cfg.marble_scene_roots)
+            marble_loaded = False
+            if marble_scenes:
+                chosen = random.Random(cfg.seed + hash(env_name)).choice(marble_scenes)
+                runtime.set_background_scene(chosen)
+                marble_loaded = True
+                summary["components"].setdefault("artifacts_correction", {})["marble_background"] = str(chosen)
+                print(f"[pipeline:{env_name}] marble background: {chosen}", flush=True)
+            try:
+                captured_views = artifacts_correction.capture_sphere_views(runtime, sphere_cameras, spp=cfg.spp)
+                entries = artifacts_correction.generate_pairs(
+                    runtime,
+                    cameras=sphere_cameras,
+                    output_dir=env_dir / "01_artifacts_correction",
+                    count=cfg.artifacts_pairs_per_env,
+                    full_iterations=cfg.full_iterations,
+                    splat_kind=cfg.splat_kind,
+                    seed=cfg.seed,
+                    spp=cfg.spp,
+                    captured_views=captured_views,
+                )
+            finally:
+                if marble_loaded:
+                    runtime.set_background_scene(None)
+            summary["components"].setdefault("artifacts_correction", {})["num_pairs"] = len(entries)
             print(f"[pipeline:{env_name}] <<< 01_artifacts_correction wrote {len(entries)} pairs", flush=True)
 
         if "asset_reinsertion" in cfg.components:
@@ -242,6 +262,24 @@ def _run_env(env_name: str, cfg: PipelineConfig) -> dict[str, Any]:
         runtime.close()
         _release_cuda_memory()
     return summary
+
+
+def _gather_marble_scenes(roots: Iterable[str]) -> list[Path]:
+    suffixes = {".usda", ".usdc", ".usdz", ".usd"}
+    out: list[Path] = []
+    for root in roots:
+        path = Path(root)
+        if not path.exists():
+            continue
+        for candidate in path.rglob("*"):
+            if not candidate.is_file() or candidate.suffix.lower() not in suffixes:
+                continue
+            # Collider-only USDs lack visible meshes; they're paired with a
+            # render USD and shouldn't be referenced as the background.
+            if "collider" in candidate.stem.lower():
+                continue
+            out.append(candidate.resolve())
+    return sorted(out)
 
 
 def _release_cuda_memory() -> None:

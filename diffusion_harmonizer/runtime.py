@@ -375,6 +375,36 @@ class HarmonizerRuntime:
             xf = UsdGeom.Xformable(prim)
             _set_xform_op(xf, UsdGeom.XformOp.TypeRotateXYZ, (0.0, 0.0, float(rotation_deg)), double=False)
 
+    def set_background_scene(
+        self,
+        usd_path: str | Path | None,
+        prim_path: str = "/World/MarbleBackground",
+    ) -> None:
+        """Reference a USD scene as the visible background.
+
+        Marble (and other 3D) scenes give camera rays real geometry to hit
+        instead of the dome HDRI's latlong projection, which the data-gen
+        hypothesis identifies as a background-quality bottleneck. The dome
+        light at ``/World/background`` is left in place and continues to
+        provide illumination — this method only adds occluding geometry.
+
+        Pass ``None`` to remove a previously referenced background scene.
+        """
+
+        from pxr import UsdGeom
+
+        existing = self.stage.GetPrimAtPath(prim_path)
+        if usd_path is None:
+            if existing.IsValid():
+                self.stage.RemovePrim(prim_path)
+            return
+
+        resolved = str(Path(usd_path).expanduser().resolve())
+        prim = existing if existing.IsValid() else UsdGeom.Xform.Define(self.stage, prim_path).GetPrim()
+        refs = prim.GetReferences()
+        refs.ClearReferences()
+        refs.AddReference(resolved)
+
     def set_distant_light(
         self,
         prim_path: str = "/World/HarmonizerSun",
