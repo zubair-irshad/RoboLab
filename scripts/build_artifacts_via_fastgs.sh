@@ -58,6 +58,9 @@ echo "[$ENV_NAME] using conda env: $(python -c 'import sys; print(sys.executable
 
 mkdir -p "$RUNS"
 
+# All path resolution must happen in the parent shell BEFORE we cd into
+# the FastGS repo — otherwise $(realpath …) evaluates with the FastGS
+# repo as cwd and our relative ./data/... paths fail to resolve.
 train_one() {
     local strategy="$1"
     local iters="$2"
@@ -67,11 +70,14 @@ train_one() {
         echo "[$ENV_NAME] skipping $strategy — no $src dir."
         return
     fi
+    local src_abs model_abs
+    src_abs=$(realpath "$src")
+    model_abs=$(realpath -m "$model")
     echo "[$ENV_NAME] >>> fastgs train $strategy ($iters iters)"
     rm -rf "$model"
     (cd "$FASTGS_REPO" && python train.py \
-        --source_path "$(realpath "$src")" \
-        --model_path "$(realpath -m "$model")" \
+        --source_path "$src_abs" \
+        --model_path "$model_abs" \
         --iterations "$iters")
 }
 
@@ -84,14 +90,17 @@ render_one() {
         echo "[$ENV_NAME] skipping render $strategy — missing $src or $model."
         return
     fi
+    local src_abs model_abs
+    src_abs=$(realpath "$src")
+    model_abs=$(realpath "$model")
     echo "[$ENV_NAME] >>> fastgs render $strategy"
     # Vanilla 3DGS render.py loads gaussians from --model_path and reads
     # cameras from --source_path. Pointing at the render/ dataset (all
     # hemisphere poses) re-renders the trained model at every captured
     # viewpoint, including the sparse_arc held-out sector.
     (cd "$FASTGS_REPO" && python render.py \
-        --source_path "$(realpath "$src")" \
-        --model_path "$(realpath -m "$model")" \
+        --source_path "$src_abs" \
+        --model_path "$model_abs" \
         --iteration "$iters")
 }
 
