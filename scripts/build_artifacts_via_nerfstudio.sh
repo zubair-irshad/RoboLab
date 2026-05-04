@@ -14,8 +14,10 @@
 
 set -euo pipefail
 
-ENV_NAME="${1:?Usage: $0 <env_name> [iterations]}"
+ENV_NAME="${1:?Usage: $0 <env_name> [iterations] [vis]}"
 ITERS="${2:-30000}"
+VIS="${3:-wandb}"           # nerfstudio --vis target: viewer | wandb | tensorboard | viewer+wandb | none
+WANDB_PROJECT="${WANDB_PROJECT:-diffusion-harmonizer}"
 
 ROOT="data/diffusion_harmonizer/${ENV_NAME}/01_artifacts_correction"
 NS="${ROOT}/nerfstudio"
@@ -35,9 +37,12 @@ train_one() {
         echo "[$ENV_NAME] skipping $strategy — no $NS/$strategy dir."
         return
     fi
-    echo "[$ENV_NAME] >>> ns-train $strategy ($iters iters)"
+    echo "[$ENV_NAME] >>> ns-train $strategy ($iters iters, --vis $VIS)"
     ns-train splatfacto \
         --max-num-iterations "$iters" \
+        --vis "$VIS" \
+        --experiment-name "${ENV_NAME}_${strategy}" \
+        --project-name "$WANDB_PROJECT" \
         --data "$NS/$strategy" \
         --output-dir "$RUNS/$strategy"
 }
