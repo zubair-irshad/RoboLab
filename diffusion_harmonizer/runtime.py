@@ -379,63 +379,68 @@ class HarmonizerRuntime:
         self,
         usd_path: str | Path | None,
         prim_path: str = "/World/MarbleBackground",
+        collider_path: str | Path | None = None,
+        collider_prim_path: str = "/World/MarbleBackgroundCollider",
     ) -> None:
         """Reference a USD scene as the visible background.
 
-        Marble (and other 3D) scenes give camera rays real geometry to hit
-        instead of the dome HDRI's latlong projection, which the data-gen
-        hypothesis identifies as a background-quality bottleneck. The dome
-        light at ``/World/background`` is left in place and continues to
-        provide illumination — this method only adds occluding geometry.
+        Marble assets are NuRec neural volumes (``omni:nurec:isNuRecVolume``,
+        ``OmniNuRecFieldAsset`` fields) — the path tracer renders them, but
+        the rasterized depth render product cannot intersect them, so depth
+        comes back as +inf on every BG pixel.
 
-        We force ``visibility=inherited`` and ``purpose=default`` on every
-        descendant of the referenced subtree. Without this, marble assets
-        whose author tagged sub-prims with ``purpose=guide`` / ``proxy`` /
-        ``render`` get rasterized into rgb (path tracer respects render+
-        default) but skipped by the depth render product (rasterized depth
-        only honors purpose=default). Symptom: ``depth.npy`` is +inf on every
-        BG pixel even though rgb shows the kitchen — which then leaves the
-        depth-init PLY with zero BG seed points and lets 3DGS bloom floaters.
+        Workaround: pass ``collider_path`` pointing at a polygonal proxy of
+        the same scene (e.g. ``MarbleKitchen_collider.usd`` shipped alongside
+        the NuRec asset). The collider is referenced under
+        ``collider_prim_path`` with ``purpose=proxy``. RTX path tracer skips
+        proxy-purpose prims so rgb stays NuRec-only, while the rasterized
+        depth pass picks them up — giving us actual wall distances.
 
-        Pass ``None`` to remove a previously referenced background scene.
+        The dome light at ``/World/background`` is left in place either way.
+
+        Pass ``usd_path=None`` to remove the previously referenced background.
         """
 
-        from pxr import Usd, UsdGeom
+        from pxr import UsdGeom
 
-        existing = self.stage.GetPrimAtPath(prim_path)
+        # Tear down any previous references on both prim paths.
         if usd_path is None:
-            if existing.IsValid():
-                self.stage.RemovePrim(prim_path)
+            for p in (prim_path, collider_prim_path):
+                existing = self.stage.GetPrimAtPath(p)
+                if existing.IsValid():
+                    self.stage.RemovePrim(p)
             return
 
+        # Visible NuRec / mesh background.
         resolved = str(Path(usd_path).expanduser().resolve())
+        existing = self.stage.GetPrimAtPath(prim_path)
         prim = existing if existing.IsValid() else UsdGeom.Xform.Define(self.stage, prim_path).GetPrim()
         refs = prim.GetReferences()
         refs.ClearReferences()
         refs.AddReference(resolved)
 
-        # Walk the whole subtree (including instance proxies) and force the
-        # imageable attrs that make the depth pass actually intersect it.
-        forced_purpose = 0
-        forced_visible = 0
-        for desc in Usd.PrimRange(prim, Usd.TraverseInstanceProxies()):
-            img = UsdGeom.Imageable(desc)
-            if not img:
-                continue
-            purpose_attr = img.GetPurposeAttr()
-            if purpose_attr.Get() != UsdGeom.Tokens.default_:
-                purpose_attr.Set(UsdGeom.Tokens.default_)
-                forced_purpose += 1
-            vis_attr = img.GetVisibilityAttr()
-            if vis_attr.Get() == UsdGeom.Tokens.invisible:
-                vis_attr.Set(UsdGeom.Tokens.inherited)
-                forced_visible += 1
-        if forced_purpose or forced_visible:
-            print(
-                f"[runtime] {prim_path}: forced purpose=default on {forced_purpose} prim(s), "
-                f"visibility=inherited on {forced_visible} prim(s)",
-                flush=True,
+        # Optional polygonal collider used as the depth-pass proxy.
+        if collider_path is not None:
+            col_resolved = str(Path(collider_path).expanduser().resolve())
+            col_existing = self.stage.GetPrimAtPath(collider_prim_path)
+            col_prim = (
+                col_existing
+                if col_existing.IsValid()
+                else UsdGeom.Xform.Define(self.stage, collider_prim_path).GetPrim()
             )
+            col_refs = col_prim.GetReferences()
+            col_refs.ClearReferences()
+            col_refs.AddReference(col_resolved)
+            # purpose=proxy keeps the collider out of path-traced rgb but
+            # in scope for rasterized depth. The attr lives on the Xform we
+            # just defined so it overrides whatever the referenced layer set.
+            UsdGeom.Imageable(col_prim).GetPurposeAttr().Set(UsdGeom.Tokens.proxy)
+            print(f"[runtime] {collider_prim_path}: loaded depth-proxy {col_resolved}", flush=True)
+        else:
+            # If a previous call wired up a collider, drop it.
+            existing_col = self.stage.GetPrimAtPath(collider_prim_path)
+            if existing_col.IsValid():
+                self.stage.RemovePrim(collider_prim_path)
 
     def set_distant_light(
         self,

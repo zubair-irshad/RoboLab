@@ -107,9 +107,14 @@ def _capture_env(env_name: str, cfg: ArtifactCaptureConfig) -> dict:
         marble_scenes = _gather_marble_scenes(cfg.marble_scene_roots)
         if marble_scenes:
             chosen = random.Random(cfg.seed + hash(env_name)).choice(marble_scenes)
-            runtime.set_background_scene(chosen)
+            collider = _find_collider_for(chosen)
+            runtime.set_background_scene(chosen, collider_path=collider)
             marble_loaded = True
-            print(f"[artifact:{env_name}] marble background: {chosen}", flush=True)
+            print(
+                f"[artifact:{env_name}] marble background: {chosen}"
+                + (f"  (collider: {collider.name})" if collider else "  (no collider found)"),
+                flush=True,
+            )
         return _hemispheric_snapshot(runtime, runtime.env, output_dir, cfg, env_name)
     finally:
         if marble_loaded:
@@ -119,6 +124,31 @@ def _capture_env(env_name: str, cfg: ArtifactCaptureConfig) -> dict:
                 pass
         runtime.close()
         _release_cuda_memory()
+
+
+def _find_collider_for(marble_path: Path) -> Path | None:
+    """Find the polygonal collider USD that ships next to a marble NuRec asset.
+
+    Marble NuRec packs typically include a sibling ``<stem>_collider.usd``
+    or generic ``*_collider.usd`` in the same directory. We use that as
+    the depth-pass proxy because rasterized ``distance_to_image_plane``
+    cannot intersect NuRec volumes.
+    """
+    parent = Path(marble_path).parent
+    stem = Path(marble_path).stem
+    candidates = [
+        parent / f"{stem}_collider.usd",
+        parent / f"{stem}_collider.usda",
+        parent / f"{stem}_collider.usdc",
+    ]
+    # Case-insensitive sibling match if exact stem doesn't hit (e.g. asset
+    # named ``marblekitchen.usda`` but collider is ``MarbleKitchen_collider.usd``).
+    for sibling in parent.glob("*collider*"):
+        candidates.append(sibling)
+    for c in candidates:
+        if c.exists() and c.is_file():
+            return c.resolve()
+    return None
 
 
 def _gather_marble_scenes(roots) -> list[Path]:
