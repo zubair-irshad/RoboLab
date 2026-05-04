@@ -45,6 +45,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sparse-k", type=int, default=24,
                         help="Number of views the sparse_k strategy keeps.")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-depth-init", dest="with_depth_init", action="store_false", default=True,
+                        help="Skip the combined depth-back-projected PLY. Splatfacto will fall back "
+                             "to random init, which converges much slower on object-centric captures.")
+    parser.add_argument("--depth-stride", type=int, default=8,
+                        help="Pixel stride when back-projecting depth to a point cloud (1 = every pixel).")
+    parser.add_argument("--depth-target-points", type=int, default=200_000,
+                        help="Subsample the combined point cloud to at most this many points.")
     return parser.parse_args()
 
 
@@ -73,7 +80,14 @@ def main() -> None:
     for art_dir in targets:
         env_name = art_dir.parent.name
         try:
-            ns_root, strategies = export_env(art_dir, sparse_k=args.sparse_k, seed=args.seed)
+            ns_root, strategies = export_env(
+                art_dir,
+                sparse_k=args.sparse_k,
+                seed=args.seed,
+                with_depth_init=args.with_depth_init,
+                depth_stride=args.depth_stride,
+                depth_target_points=args.depth_target_points,
+            )
         except Exception as exc:
             summary["envs"][env_name] = {"error": str(exc), "traceback": traceback.format_exc()}
             print(f"[export:{env_name}] FAILED: {exc}", flush=True)

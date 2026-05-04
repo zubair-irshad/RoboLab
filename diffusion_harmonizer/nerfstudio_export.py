@@ -55,7 +55,123 @@ def _read_view(view_dir: Path) -> dict | None:
         return None
     K = np.asarray(json.loads(K_path.read_text())["K"], dtype=np.float64)
     T = np.asarray(json.loads(E_path.read_text())["world_T_cam_gl"], dtype=np.float64)
-    return {"view_id": int(view_dir.name), "rgb_path": rgb_path, "K": K, "T": T}
+    depth_path = view_dir / "depth.npy"
+    return {
+        "view_id": int(view_dir.name),
+        "rgb_path": rgb_path,
+        "depth_path": depth_path if depth_path.exists() else None,
+        "K": K,
+        "T": T,
+    }
+
+
+def _back_project_view(view: dict, stride: int = 8, depth_min: float = 0.05, depth_max: float = 20.0) -> tuple[np.ndarray, np.ndarray]:
+    """Back-project a view's depth map to world-space colored points.
+
+    Pixel (u, v) -> camera-frame OpenCV point (x_cv, y_cv, z_cv) via pinhole,
+    then to OpenGL camera frame (flip Y and Z) so the world transform we
+    saved (``world_T_cam_gl`` in OpenGL convention) maps it correctly to
+    world coordinates. Output: (N, 3) points in world frame, (N, 3) uint8
+    colors.
+    """
+
+    if view.get("depth_path") is None:
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+
+    import imageio.v3 as iio
+
+    rgb = np.asarray(iio.imread(view["rgb_path"]))
+    if rgb.ndim == 3 and rgb.shape[-1] == 4:
+        rgb = rgb[..., :3]
+    depth = np.load(view["depth_path"]).astype(np.float32).squeeze()
+    if depth.ndim != 2:
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+
+    h, w = depth.shape[:2]
+    ys, xs = np.mgrid[0:h:stride, 0:w:stride]
+    z = depth[ys, xs]
+    valid = np.isfinite(z) & (z > depth_min) & (z < depth_max)
+    if not np.any(valid):
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+
+    K = view["K"]
+    T = view["T"]
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    # OpenCV pinhole back-projection (image y goes down, depth = +Z forward)
+    x_cv = (xs[valid] - cx) * z[valid] / fx
+    y_cv = (ys[valid] - cy) * z[valid] / fy
+    # Convert to the OpenGL camera frame our world_T_cam_gl was built for
+    # (Y up, Z back): flip Y and Z signs.
+    points_cam = np.stack(
+        [x_cv, -y_cv, -z[valid], np.ones_like(z[valid])], axis=-1
+    )
+    points_world = (T @ points_cam.T).T[:, :3]
+    colors = rgb[ys[valid], xs[valid]].astype(np.uint8)
+    if colors.ndim == 1:
+        colors = np.repeat(colors[:, None], 3, axis=1)
+    return points_world.astype(np.float32), colors
+
+
+def _write_ply_xyz_rgb(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
+    n = int(points.shape[0])
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        f"element vertex {n}\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        "end_header\n"
+    )
+    verts = np.empty(
+        n,
+        dtype=[
+            ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+            ("red", "u1"), ("green", "u1"), ("blue", "u1"),
+        ],
+    )
+    verts["x"] = points[:, 0]
+    verts["y"] = points[:, 1]
+    verts["z"] = points[:, 2]
+    verts["red"] = colors[:, 0]
+    verts["green"] = colors[:, 1]
+    verts["blue"] = colors[:, 2]
+    with open(path, "wb") as f:
+        f.write(header.encode("ascii"))
+        verts.tofile(f)
+
+
+def _build_combined_pointcloud(
+    views: list[dict],
+    output_path: Path,
+    stride: int = 8,
+    target_points: int = 200_000,
+    seed: int = 42,
+) -> int:
+    """Concat back-projected points from every view, subsample, write PLY.
+
+    Returns the number of points written. Returns 0 if no view has depth.
+    """
+
+    points_list: list[np.ndarray] = []
+    colors_list: list[np.ndarray] = []
+    for view in views:
+        pts, cols = _back_project_view(view, stride=stride)
+        if pts.size:
+            points_list.append(pts)
+            colors_list.append(cols)
+    if not points_list:
+        return 0
+    points = np.concatenate(points_list, axis=0)
+    colors = np.concatenate(colors_list, axis=0)
+    if points.shape[0] > target_points:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(points.shape[0], size=target_points, replace=False)
+        points = points[idx]
+        colors = colors[idx]
+    _write_ply_xyz_rgb(output_path, points, colors)
+    return int(points.shape[0])
 
 
 def _stage_image_pool(views: list[dict], images_dir: Path) -> None:
@@ -134,6 +250,9 @@ def export_env(
     output_dir: Path | None = None,
     sparse_k: int = 24,
     seed: int = 42,
+    with_depth_init: bool = True,
+    depth_stride: int = 8,
+    depth_target_points: int = 200_000,
 ) -> tuple[Path, list[StrategyExport]]:
     """Export one env's captures into the nerfstudio strategy tree.
 
@@ -167,6 +286,29 @@ def export_env(
     images_pool = output_dir / "images"
     _stage_image_pool(views, images_pool)
 
+    # Optional combined depth-back-projected PLY for splatfacto init.
+    # Splatfacto's nerfstudio_dataparser reads ``ply_file_path`` from
+    # transforms.json and uses it as the initial Gaussian centers + colors.
+    # Skips silently if no view has depth.npy.
+    ply_root = output_dir / "depth_init.ply"
+    ply_filename: str | None = None
+    n_init_points = 0
+    if with_depth_init:
+        n_init_points = _build_combined_pointcloud(
+            views,
+            ply_root,
+            stride=depth_stride,
+            target_points=depth_target_points,
+            seed=seed,
+        )
+        if n_init_points > 0:
+            ply_filename = ply_root.name
+            print(
+                f"[export] {env_artifacts_dir.parent.name}: depth_init.ply -> "
+                f"{n_init_points} points",
+                flush=True,
+            )
+
     del seed  # kept for backward compat; we now pick spatially deterministic subsets
     all_ids = sorted(v["view_id"] for v in views)
     n = len(all_ids)
@@ -195,6 +337,15 @@ def export_env(
         transforms = _build_transforms(
             frames, width=width, height=height, train_ids=train_ids, eval_ids=eval_ids,
         )
+        if ply_filename is not None:
+            ply_link = strat_dir / ply_filename
+            if ply_link.exists() or ply_link.is_symlink():
+                ply_link.unlink()
+            try:
+                ply_link.symlink_to(Path("..") / ply_filename)
+            except (OSError, NotImplementedError):
+                shutil.copy2(ply_root, ply_link)
+            transforms["ply_file_path"] = ply_filename
         (strat_dir / "transforms.json").write_text(json.dumps(transforms, indent=2))
         strategies.append(
             StrategyExport(
