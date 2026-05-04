@@ -166,10 +166,16 @@ def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: ArtifactCaptureCo
                 depth_arr = depth_t[0].detach().cpu().numpy().astype(np.float32).squeeze()
 
             K = base_cam.data.intrinsic_matrices[0].detach().cpu().numpy().astype(np.float32)
-            world_T_cam = _build_world_T_cam(
-                base_cam.data.pos_w[0].detach().cpu().numpy(),
-                base_cam.data.quat_w_world[0].detach().cpu().numpy(),
-            )
+            # Build the camera-to-world matrix directly from our look-at math
+            # (already in OpenGL convention: -Z forward, +Y up, +X right).
+            # We CANNOT read it back from Isaac Lab's ``data.pos_w`` /
+            # ``data.quat_w_world`` because those return the pose in Isaac's
+            # "world" convention (+X forward, +Y left, +Z up), so even though
+            # we set the pose with convention="opengl" the read-back is in a
+            # different frame. Saving Isaac-world as if it were OpenGL was
+            # making nerfstudio interpret every camera rotated by ~90°,
+            # capping training PSNR at ~13 dB.
+            world_T_cam = _build_world_T_cam_from_lookat(eye, center, up)
 
             view_dir = views_dir / f"{idx:04d}"
             view_dir.mkdir(parents=True, exist_ok=True)
@@ -277,6 +283,29 @@ def _look_at_quat_opengl(eye, target, up):
     q = np.array([w, x, y, z], dtype=np.float64)
     q /= np.linalg.norm(q)
     return q
+
+
+def _build_world_T_cam_from_lookat(eye, target, up) -> np.ndarray:
+    """Compose a (4, 4) world-from-camera matrix in OpenGL convention.
+
+    OpenGL camera basis: +X right, +Y up, +Z back (-Z forward). The
+    rotation columns are therefore (right, up, -forward) where ``forward``
+    is the unit vector from eye toward target. Translation is just ``eye``.
+    """
+
+    eye = np.asarray(eye, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    up = np.asarray(up, dtype=np.float64)
+    f = target - eye
+    f /= np.linalg.norm(f) + 1e-12
+    r = np.cross(f, up)
+    r /= np.linalg.norm(r) + 1e-12
+    u = np.cross(r, f)
+    R = np.stack([r, u, -f], axis=1)
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = eye
+    return T
 
 
 def _build_world_T_cam(pos: np.ndarray, quat_wxyz: np.ndarray) -> np.ndarray:
