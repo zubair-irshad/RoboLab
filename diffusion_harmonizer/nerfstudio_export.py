@@ -197,20 +197,29 @@ def export_env(
             )
         )
 
+    # The two paper strategies that map cleanly onto hemispheric Fibonacci
+    # captures. cycle / cross_ref were designed for temporal driving
+    # sequences; on a static-scene spiral they reduce to weaker forms of
+    # sparse_k, so we skip them.
+    del even_ids, odd_ids, first_half, second_half  # noqa: F821 (kept above for parity)
     write_variant(
         "full",
         views,
         train_ids=None,
         eval_ids=None,
-        note="All views; clean reference splatfacto run.",
+        note="All views as train. Clean reference splatfacto run; pairs as the target.",
         ns_train_args="splatfacto --max-num-iterations 30000",
     )
     write_variant(
         "sparse_k",
-        [v for v in views if v["view_id"] in sparse_ids],
-        train_ids=None,
-        eval_ids=None,
-        note=f"{len(sparse_ids)} of {len(views)} views; produces blurred / hole-y novel views.",
+        views,  # all frames go in transforms.json
+        train_ids=sparse_ids,
+        eval_ids=[vid for vid in all_ids if vid not in set(sparse_ids)],
+        note=(
+            f"{len(sparse_ids)} of {len(views)} views as train_filenames, the rest as "
+            f"eval_filenames. The trained model has blurred / hole-y novel-view renders "
+            f"at the held-out poses — exactly the DIFIX3D+ sparse-reconstruction signature."
+        ),
         ns_train_args="splatfacto --max-num-iterations 30000",
     )
     write_variant(
@@ -218,24 +227,12 @@ def export_env(
         views,
         train_ids=None,
         eval_ids=None,
-        note="All views, deliberately undertrained — pass --max-num-iterations <small>.",
+        note=(
+            "All views as train, deliberately undertrained. Pass --max-num-iterations "
+            "1500-3000 so densification stops before the model converges; renders show "
+            "spurious geometry and missing details across the whole hemisphere."
+        ),
         ns_train_args="splatfacto --max-num-iterations 1500",
-    )
-    write_variant(
-        "cycle",
-        views,
-        train_ids=even_ids,
-        eval_ids=odd_ids,
-        note="Train on even-indexed views, render odd as held-out.",
-        ns_train_args="splatfacto --max-num-iterations 30000",
-    )
-    write_variant(
-        "cross_ref",
-        views,
-        train_ids=first_half,
-        eval_ids=second_half,
-        note="Train on first half, render second half as held-out.",
-        ns_train_args="splatfacto --max-num-iterations 30000",
     )
 
     return output_dir, strategies
