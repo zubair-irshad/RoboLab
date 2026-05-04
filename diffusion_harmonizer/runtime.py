@@ -388,10 +388,19 @@ class HarmonizerRuntime:
         light at ``/World/background`` is left in place and continues to
         provide illumination — this method only adds occluding geometry.
 
+        We force ``visibility=inherited`` and ``purpose=default`` on every
+        descendant of the referenced subtree. Without this, marble assets
+        whose author tagged sub-prims with ``purpose=guide`` / ``proxy`` /
+        ``render`` get rasterized into rgb (path tracer respects render+
+        default) but skipped by the depth render product (rasterized depth
+        only honors purpose=default). Symptom: ``depth.npy`` is +inf on every
+        BG pixel even though rgb shows the kitchen — which then leaves the
+        depth-init PLY with zero BG seed points and lets 3DGS bloom floaters.
+
         Pass ``None`` to remove a previously referenced background scene.
         """
 
-        from pxr import UsdGeom
+        from pxr import Usd, UsdGeom
 
         existing = self.stage.GetPrimAtPath(prim_path)
         if usd_path is None:
@@ -404,6 +413,29 @@ class HarmonizerRuntime:
         refs = prim.GetReferences()
         refs.ClearReferences()
         refs.AddReference(resolved)
+
+        # Walk the whole subtree (including instance proxies) and force the
+        # imageable attrs that make the depth pass actually intersect it.
+        forced_purpose = 0
+        forced_visible = 0
+        for desc in Usd.PrimRange(prim, Usd.TraverseInstanceProxies()):
+            img = UsdGeom.Imageable(desc)
+            if not img:
+                continue
+            purpose_attr = img.GetPurposeAttr()
+            if purpose_attr.Get() != UsdGeom.Tokens.default_:
+                purpose_attr.Set(UsdGeom.Tokens.default_)
+                forced_purpose += 1
+            vis_attr = img.GetVisibilityAttr()
+            if vis_attr.Get() == UsdGeom.Tokens.invisible:
+                vis_attr.Set(UsdGeom.Tokens.inherited)
+                forced_visible += 1
+        if forced_purpose or forced_visible:
+            print(
+                f"[runtime] {prim_path}: forced purpose=default on {forced_purpose} prim(s), "
+                f"visibility=inherited on {forced_visible} prim(s)",
+                flush=True,
+            )
 
     def set_distant_light(
         self,

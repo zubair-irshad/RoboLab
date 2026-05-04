@@ -142,25 +142,109 @@ def _write_ply_xyz_rgb(path: Path, points: np.ndarray, colors: np.ndarray) -> No
         verts.tofile(f)
 
 
+def _bg_sphere_seed(
+    center: np.ndarray,
+    radius: float,
+    n: int,
+    seed: int,
+    color: tuple[int, int, int] = (160, 160, 160),
+) -> tuple[np.ndarray, np.ndarray]:
+    """Random points on a sphere of ``radius`` around ``center``.
+
+    Reason these exist: vanilla 3DGS / FastGS densifies *from existing
+    gaussians*. With zero seed coverage of the kitchen BG (depth pass
+    returns +inf for marble pixels in our captures), the BG region has no
+    gaussians at all and 3DGS invents floaters via random splits. Seeding
+    a thin neutral-grey shell around the expected scene extent gives 3DGS
+    starting gaussians that the photometric loss can then pull onto the
+    actual marble geometry visible in rgb.
+    """
+
+    rng = np.random.default_rng(seed)
+    v = rng.normal(size=(n, 3)).astype(np.float32)
+    v /= (np.linalg.norm(v, axis=1, keepdims=True) + 1e-12)
+    pts = center.astype(np.float32) + radius * v
+    cols = np.tile(np.array(color, dtype=np.uint8), (n, 1))
+    return pts, cols
+
+
 def _build_combined_pointcloud(
     views: list[dict],
     output_path: Path,
     stride: int = 8,
     target_points: int = 200_000,
     seed: int = 42,
+    depth_max: float = 50.0,
+    bg_sphere_center: tuple[float, float, float] = (0.4, 0.0, 0.4),
+    bg_sphere_radius: float = 4.0,
+    bg_sphere_points: int = 20_000,
 ) -> int:
     """Concat back-projected points from every view, subsample, write PLY.
 
     Returns the number of points written. Returns 0 if no view has depth.
+
+    Two changes vs the original implementation:
+      * ``depth_max`` raised to 50 m and inf/nan now logged. The old 20 m
+        clip silently dropped any marble wall pixels that did get a finite
+        depth past 20 m.
+      * ``bg_sphere_points`` random points on a sphere of ``bg_sphere_radius``
+        around ``bg_sphere_center`` are concatenated *before* subsampling.
+        This guarantees BG seed coverage even if the depth pass missed the
+        marble entirely (returning +inf).
     """
 
     points_list: list[np.ndarray] = []
     colors_list: list[np.ndarray] = []
+    finite_depths: list[np.ndarray] = []
+    inf_frac_acc = 0.0
+    n_views_with_depth = 0
     for view in views:
-        pts, cols = _back_project_view(view, stride=stride)
+        pts, cols = _back_project_view(view, stride=stride, depth_max=depth_max)
         if pts.size:
             points_list.append(pts)
             colors_list.append(cols)
+        # Lightweight stats so the user can sanity-check how much BG is
+        # registering after the marble-visibility fix in runtime.py.
+        dpath = view.get("depth_path")
+        if dpath is not None:
+            try:
+                z = np.load(dpath).astype(np.float32).squeeze()
+                if z.ndim == 2:
+                    inf_frac_acc += float(np.isinf(z).mean())
+                    finite = z[np.isfinite(z) & (z > 0)]
+                    if finite.size:
+                        finite_depths.append(np.array([finite.min(), np.median(finite), finite.max()]))
+                    n_views_with_depth += 1
+            except Exception:
+                pass
+    if n_views_with_depth:
+        avg_inf = inf_frac_acc / n_views_with_depth
+        if finite_depths:
+            stats = np.stack(finite_depths)
+            print(
+                f"[depth-stats] views={n_views_with_depth} inf_frac_avg={avg_inf:.3f} "
+                f"finite_min_med_max=[{stats[:,0].min():.2f}, "
+                f"{np.median(stats[:,1]):.2f}, {stats[:,2].max():.2f}] m",
+                flush=True,
+            )
+
+    # Inject the BG sphere seed regardless of whether back-projection found
+    # anything — the whole point is to backstop the depth pass when it misses.
+    if bg_sphere_points > 0:
+        bg_pts, bg_cols = _bg_sphere_seed(
+            np.asarray(bg_sphere_center, dtype=np.float64),
+            radius=float(bg_sphere_radius),
+            n=int(bg_sphere_points),
+            seed=seed + 1,
+        )
+        points_list.append(bg_pts)
+        colors_list.append(bg_cols)
+        print(
+            f"[depth-init] +{bg_sphere_points} BG sphere seeds "
+            f"@ r={bg_sphere_radius:.2f} m around {tuple(bg_sphere_center)}",
+            flush=True,
+        )
+
     if not points_list:
         return 0
     points = np.concatenate(points_list, axis=0)
@@ -253,6 +337,9 @@ def export_env(
     with_depth_init: bool = True,
     depth_stride: int = 8,
     depth_target_points: int = 200_000,
+    depth_max: float = 50.0,
+    bg_sphere_radius: float = 4.0,
+    bg_sphere_points: int = 20_000,
 ) -> tuple[Path, list[StrategyExport]]:
     """Export one env's captures into the nerfstudio strategy tree.
 
@@ -267,6 +354,18 @@ def export_env(
     if output_dir is None:
         output_dir = Path(env_artifacts_dir) / "nerfstudio"
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Capture center for the BG sphere comes from manifest.json so the seed
+    # is co-located with the camera shell. Falls back to the default the
+    # capture script uses.
+    bg_center = (0.4, 0.0, 0.4)
+    manifest_path = Path(env_artifacts_dir) / "manifest.json"
+    if manifest_path.exists():
+        try:
+            mf = json.loads(manifest_path.read_text())
+            bg_center = tuple(mf.get("center", bg_center))
+        except Exception:
+            pass
 
     views = sorted(
         (v for v in (_read_view(d) for d in views_dir.iterdir() if d.is_dir()) if v is not None),
@@ -300,6 +399,10 @@ def export_env(
             stride=depth_stride,
             target_points=depth_target_points,
             seed=seed,
+            depth_max=depth_max,
+            bg_sphere_center=bg_center,
+            bg_sphere_radius=bg_sphere_radius,
+            bg_sphere_points=bg_sphere_points,
         )
         if n_init_points > 0:
             ply_filename = ply_root.name

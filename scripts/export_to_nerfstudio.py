@@ -52,6 +52,16 @@ def parse_args() -> argparse.Namespace:
                         help="Pixel stride when back-projecting depth to a point cloud (1 = every pixel).")
     parser.add_argument("--depth-target-points", type=int, default=200_000,
                         help="Subsample the combined point cloud to at most this many points.")
+    parser.add_argument("--depth-max", type=float, default=50.0,
+                        help="Drop back-projected pixels with depth >= this many meters. "
+                             "Old default (20) silently dropped marble walls past 20 m. Bump if "
+                             "the post-fix depth distribution shows kitchen geometry beyond.")
+    parser.add_argument("--bg-sphere-radius", type=float, default=4.0,
+                        help="Radius of the BG seed sphere injected into depth_init.ply (around "
+                             "the capture center from manifest.json). Set to scene-extent so 3DGS "
+                             "has gaussians to densify into kitchen walls.")
+    parser.add_argument("--bg-sphere-points", type=int, default=20_000,
+                        help="Number of BG seed points; 0 disables.")
     return parser.parse_args()
 
 
@@ -87,6 +97,9 @@ def main() -> None:
                 with_depth_init=args.with_depth_init,
                 depth_stride=args.depth_stride,
                 depth_target_points=args.depth_target_points,
+                depth_max=args.depth_max,
+                bg_sphere_radius=args.bg_sphere_radius,
+                bg_sphere_points=args.bg_sphere_points,
             )
         except Exception as exc:
             summary["envs"][env_name] = {"error": str(exc), "traceback": traceback.format_exc()}
