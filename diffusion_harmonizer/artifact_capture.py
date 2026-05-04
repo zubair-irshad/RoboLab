@@ -60,6 +60,10 @@ class ArtifactCaptureConfig:
     num_envs: int = 1
     physx_buffer_scale: float = 0.1
     use_path_tracing: bool = True
+    # Marble (3D) scenes referenced as the visible background instead of dome
+    # HDRIs, to test the hypothesis that latlong HDR projection hurts
+    # background rendering quality. Set to () to fall back to plain HDRI.
+    marble_scene_roots: tuple[str, ...] = ("assets/scenes/marble",)
 
 
 def run_artifact_capture(env_names: list[str], cfg: ArtifactCaptureConfig) -> dict:
@@ -98,11 +102,39 @@ def _capture_env(env_name: str, cfg: ArtifactCaptureConfig) -> dict:
         enable_depth=True,
     )
     output_dir = cfg.output_root / env_name / "01_artifacts_correction"
+    marble_loaded = False
     try:
+        marble_scenes = _gather_marble_scenes(cfg.marble_scene_roots)
+        if marble_scenes:
+            chosen = random.Random(cfg.seed + hash(env_name)).choice(marble_scenes)
+            runtime.set_background_scene(chosen)
+            marble_loaded = True
+            print(f"[artifact:{env_name}] marble background: {chosen}", flush=True)
         return _hemispheric_snapshot(runtime, runtime.env, output_dir, cfg, env_name)
     finally:
+        if marble_loaded:
+            try:
+                runtime.set_background_scene(None)
+            except Exception:
+                pass
         runtime.close()
         _release_cuda_memory()
+
+
+def _gather_marble_scenes(roots) -> list[Path]:
+    suffixes = {".usda", ".usdc", ".usdz", ".usd"}
+    out: list[Path] = []
+    for root in roots:
+        path = Path(root)
+        if not path.exists():
+            continue
+        for candidate in path.rglob("*"):
+            if not candidate.is_file() or candidate.suffix.lower() not in suffixes:
+                continue
+            if "collider" in candidate.stem.lower():
+                continue
+            out.append(candidate.resolve())
+    return sorted(out)
 
 
 def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: ArtifactCaptureConfig, env_name: str) -> dict:
