@@ -59,6 +59,8 @@ class HarmonizerRuntime:
         env_index: int = 0,
         num_envs: int = 1,
         physx_buffer_scale: float = 0.1,
+        enable_depth: bool = False,
+        enable_normals: bool = False,
     ):
         # Imports are deferred so this module is importable without Isaac Sim.
         from robolab.core.environments.config import parse_env_cfg
@@ -83,6 +85,20 @@ class HarmonizerRuntime:
         )
         if device.startswith("cuda") and physx_buffer_scale > 0 and physx_buffer_scale < 1.0:
             _shrink_gpu_physx_buffers(env_cfg, physx_buffer_scale)
+
+        # RoboLab task cfgs ship cameras with data_types=["rgb"]. To capture
+        # depth / normals (needed for the artifacts gsplat init PLY) we have
+        # to extend each TiledCamera's data_types BEFORE env construction;
+        # the renderer wires its output buffers from that list at startup
+        # and ignores additions afterwards.
+        if enable_depth or enable_normals:
+            updated = _ensure_camera_data_types(env_cfg, depth=enable_depth, normals=enable_normals)
+            if updated:
+                print(
+                    f"[runtime:{env_name}] extended camera data_types on {updated}: "
+                    f"depth={enable_depth} normals={enable_normals}",
+                    flush=True,
+                )
 
         self.env, self.env_cfg = create_env(
             scene=env_cfg,
@@ -488,6 +504,51 @@ class HarmonizerRuntime:
 def _looks_like_receiver(name: str) -> bool:
     low = name.lower()
     return any(hint in low for hint in _RECEIVER_NAME_HINTS)
+
+
+def _ensure_camera_data_types(env_cfg, *, depth: bool = False, normals: bool = False) -> list[str]:
+    """Add ``distance_to_image_plane`` / ``normals`` to every Camera in env_cfg.scene.
+
+    Returns the list of camera attribute names that were updated. Walks
+    ``env_cfg.scene`` looking for any cfg with a ``data_types`` field
+    (matches both ``CameraCfg`` and ``TiledCameraCfg``). Idempotent —
+    skips cameras that already include the requested types.
+    """
+
+    extra: list[str] = []
+    if depth:
+        extra.append("distance_to_image_plane")
+    if normals:
+        extra.append("normals")
+    if not extra:
+        return []
+
+    scene = getattr(env_cfg, "scene", None)
+    if scene is None:
+        return []
+
+    updated: list[str] = []
+    for attr_name in dir(scene):
+        if attr_name.startswith("_"):
+            continue
+        try:
+            attr = getattr(scene, attr_name)
+        except AttributeError:
+            continue
+        data_types = getattr(attr, "data_types", None)
+        if not isinstance(data_types, (list, tuple)):
+            continue
+        new_types = list(data_types)
+        for t in extra:
+            if t not in new_types:
+                new_types.append(t)
+        if new_types != list(data_types):
+            try:
+                attr.data_types = new_types
+                updated.append(attr_name)
+            except (AttributeError, TypeError):
+                pass
+    return updated
 
 
 def _shrink_gpu_physx_buffers(env_cfg, scale: float) -> None:

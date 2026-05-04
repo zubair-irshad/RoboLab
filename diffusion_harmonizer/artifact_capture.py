@@ -91,6 +91,11 @@ def _capture_env(env_name: str, cfg: ArtifactCaptureConfig) -> dict:
         device=cfg.device,
         num_envs=cfg.num_envs,
         physx_buffer_scale=cfg.physx_buffer_scale,
+        # Force depth into the camera's data_types BEFORE env construction
+        # so cam.data.output["distance_to_image_plane"] is populated when we
+        # capture each hemispheric pose. Without this, depth.npy was silently
+        # never written and the depth-init PLY exporter had nothing to read.
+        enable_depth=True,
     )
     output_dir = cfg.output_root / env_name / "01_artifacts_correction"
     try:
