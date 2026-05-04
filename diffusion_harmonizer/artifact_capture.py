@@ -202,6 +202,16 @@ def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: ArtifactCaptureCo
     rng = random.Random(cfg.seed)
     eyes = _fibonacci_hemisphere_eyes(cfg.cameras, cfg.radius_range, center, rng)
 
+    # Two-pass capture when the marble is NuRec + has a polygon collider.
+    # Pass 1: NuRec visible, collider invisible, path tracing on -> rgb.
+    # Pass 2: NuRec invisible, collider visible, path tracing off -> depth.
+    # Detected by presence of MarbleBackgroundCollider on the stage. If it
+    # isn't there (e.g. plain HDRI run), we fall through to the original
+    # single-pass capture and depth simply comes back as +inf in the BG.
+    has_collider = bool(
+        runtime.stage.GetPrimAtPath("/World/MarbleBackgroundCollider").IsValid()
+    )
+
     manifest_views = []
     t0 = time.time()
     try:
@@ -212,6 +222,15 @@ def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: ArtifactCaptureCo
             base_cam.set_world_poses(
                 positions=pos_t, orientations=quat_t, env_ids=env_ids, convention="opengl",
             )
+
+            # ---- rgb pass ----
+            if has_collider:
+                runtime.set_collider_for_depth_pass(False)
+                # path tracing should already be on from the loop entry; no
+                # need to toggle every iteration unless the depth pass below
+                # turned it off.
+                if cfg.use_path_tracing:
+                    runtime.set_path_tracing(True, spp=cfg.spp)
             env.sim.render()
             env.scene.update(0.0)
 
@@ -228,14 +247,26 @@ def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: ArtifactCaptureCo
                 rgb = np.clip(rgb, 0, 255).astype(np.uint8)
 
             depth_arr = None
-            # ``a or b`` evaluates ``bool(a)``; for multi-element tensors that
-            # raises "Boolean value of Tensor with more than one value is
-            # ambiguous". Walk the candidates explicitly with ``is not None``.
-            depth_t = out.get("distance_to_image_plane")
-            if depth_t is None:
-                depth_t = out.get("depth")
-            if depth_t is not None:
-                depth_arr = depth_t[0].detach().cpu().numpy().astype(np.float32).squeeze()
+            if has_collider:
+                # ---- depth pass ----
+                # Hide NuRec, show collider, drop path tracing (rasterized
+                # depth runs much faster and we don't need PT for distance).
+                runtime.set_collider_for_depth_pass(True)
+                if cfg.use_path_tracing:
+                    runtime.set_path_tracing(False)
+                env.sim.render()
+                env.scene.update(0.0)
+                depth_t = out.get("distance_to_image_plane")
+                if depth_t is None:
+                    depth_t = out.get("depth")
+                if depth_t is not None:
+                    depth_arr = depth_t[0].detach().cpu().numpy().astype(np.float32).squeeze()
+            else:
+                depth_t = out.get("distance_to_image_plane")
+                if depth_t is None:
+                    depth_t = out.get("depth")
+                if depth_t is not None:
+                    depth_arr = depth_t[0].detach().cpu().numpy().astype(np.float32).squeeze()
 
             K = base_cam.data.intrinsic_matrices[0].detach().cpu().numpy().astype(np.float32)
             # Build the camera-to-world matrix directly from our look-at math
@@ -266,6 +297,10 @@ def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: ArtifactCaptureCo
                     flush=True,
                 )
     finally:
+        # Make sure the stage doesn't get left in "depth pass" state if we
+        # bail mid-loop (NuRec invisible, collider visible).
+        if has_collider:
+            runtime.set_collider_for_depth_pass(False)
         base_cam.set_world_poses(
             positions=original_pos.unsqueeze(0),
             orientations=original_quat.unsqueeze(0),

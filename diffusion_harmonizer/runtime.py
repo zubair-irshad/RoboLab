@@ -381,6 +381,7 @@ class HarmonizerRuntime:
         prim_path: str = "/World/MarbleBackground",
         collider_path: str | Path | None = None,
         collider_prim_path: str = "/World/MarbleBackgroundCollider",
+        collider_visible_to_path_tracer: bool = False,
     ) -> None:
         """Reference a USD scene as the visible background.
 
@@ -390,13 +391,20 @@ class HarmonizerRuntime:
         comes back as +inf on every BG pixel.
 
         Workaround: pass ``collider_path`` pointing at a polygonal proxy of
-        the same scene (e.g. ``MarbleKitchen_collider.usd`` shipped alongside
-        the NuRec asset). The collider is referenced under
-        ``collider_prim_path`` with ``purpose=proxy``. RTX path tracer skips
-        proxy-purpose prims so rgb stays NuRec-only, while the rasterized
-        depth pass picks them up — giving us actual wall distances.
+        the same scene (e.g. ``MarbleKitchen_collider.usd``). The collider
+        is referenced at a sibling Xform path. We then use ``set_collider_for_depth_pass``
+        to flip its visibility per render so depth captures wall distances.
 
-        The dome light at ``/World/background`` is left in place either way.
+        Default behavior (``collider_visible_to_path_tracer=False``): the
+        collider is parked at ``visibility=invisible``. Callers should
+        toggle it on right before reading depth via
+        ``set_collider_for_depth_pass(True)`` and back off before the rgb
+        pass, or use ``capture_with_depth_proxy`` which wraps that.
+
+        Setting ``collider_visible_to_path_tracer=True`` makes the collider
+        permanently visible — simpler (one-pass capture) but the polygon
+        proxy then composites under the NuRec gaussians in rgb. Try this
+        first; if rgb stays clean, you don't need the two-pass capture.
 
         Pass ``usd_path=None`` to remove the previously referenced background.
         """
@@ -419,7 +427,7 @@ class HarmonizerRuntime:
         refs.ClearReferences()
         refs.AddReference(resolved)
 
-        # Optional polygonal collider used as the depth-pass proxy.
+        # Optional polygonal collider for the depth pass.
         if collider_path is not None:
             col_resolved = str(Path(collider_path).expanduser().resolve())
             col_existing = self.stage.GetPrimAtPath(collider_prim_path)
@@ -431,16 +439,53 @@ class HarmonizerRuntime:
             col_refs = col_prim.GetReferences()
             col_refs.ClearReferences()
             col_refs.AddReference(col_resolved)
-            # purpose=proxy keeps the collider out of path-traced rgb but
-            # in scope for rasterized depth. The attr lives on the Xform we
-            # just defined so it overrides whatever the referenced layer set.
-            UsdGeom.Imageable(col_prim).GetPurposeAttr().Set(UsdGeom.Tokens.proxy)
-            print(f"[runtime] {collider_prim_path}: loaded depth-proxy {col_resolved}", flush=True)
+            # purpose=default so BOTH the rgb and the depth render products
+            # see the collider when it's visible (``purpose=proxy`` was
+            # tried first and skipped by both passes in this Isaac Sim build).
+            img = UsdGeom.Imageable(col_prim)
+            img.GetPurposeAttr().Set(UsdGeom.Tokens.default_)
+            # Visibility is the per-pose toggle.
+            img.GetVisibilityAttr().Set(
+                UsdGeom.Tokens.inherited
+                if collider_visible_to_path_tracer
+                else UsdGeom.Tokens.invisible
+            )
+            mode = "always-on" if collider_visible_to_path_tracer else "off (toggle for depth pass)"
+            print(
+                f"[runtime] {collider_prim_path}: loaded depth-proxy {col_resolved}  ({mode})",
+                flush=True,
+            )
         else:
-            # If a previous call wired up a collider, drop it.
             existing_col = self.stage.GetPrimAtPath(collider_prim_path)
             if existing_col.IsValid():
                 self.stage.RemovePrim(collider_prim_path)
+
+    def set_collider_for_depth_pass(
+        self,
+        visible: bool,
+        collider_prim_path: str = "/World/MarbleBackgroundCollider",
+        nurec_prim_path: str = "/World/MarbleBackground",
+    ) -> None:
+        """Flip visibility for two-pass capture.
+
+        ``visible=False`` (rgb pass): collider hidden, NuRec visible.
+        ``visible=True``  (depth pass): collider visible, NuRec hidden.
+
+        Both prims keep ``purpose=default``; we only toggle the visibility
+        attribute, which the rasterizer and path tracer both honor.
+        """
+        from pxr import UsdGeom
+
+        col = self.stage.GetPrimAtPath(collider_prim_path)
+        nu = self.stage.GetPrimAtPath(nurec_prim_path)
+        if col.IsValid():
+            UsdGeom.Imageable(col).GetVisibilityAttr().Set(
+                UsdGeom.Tokens.inherited if visible else UsdGeom.Tokens.invisible
+            )
+        if nu.IsValid():
+            UsdGeom.Imageable(nu).GetVisibilityAttr().Set(
+                UsdGeom.Tokens.invisible if visible else UsdGeom.Tokens.inherited
+            )
 
     def set_distant_light(
         self,
