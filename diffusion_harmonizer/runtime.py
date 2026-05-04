@@ -426,6 +426,12 @@ class HarmonizerRuntime:
         refs = prim.GetReferences()
         refs.ClearReferences()
         refs.AddReference(resolved)
+        # Force the wrapper Xform's purpose/visibility so an internal
+        # ``purpose=proxy`` in the referenced USD can't silently hide the BG
+        # from both render passes (some collider USDs ship that way).
+        bg_img = UsdGeom.Imageable(prim)
+        bg_img.GetPurposeAttr().Set(UsdGeom.Tokens.default_)
+        bg_img.GetVisibilityAttr().Set(UsdGeom.Tokens.inherited)
 
         # Optional polygonal collider for the depth pass.
         if collider_path is not None:

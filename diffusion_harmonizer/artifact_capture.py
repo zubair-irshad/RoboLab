@@ -60,12 +60,13 @@ class ArtifactCaptureConfig:
     num_envs: int = 1
     physx_buffer_scale: float = 0.1
     use_path_tracing: bool = True
-    # The canonical marble NuRec scene used as the visible background. Only
-    # one asset ships in ``assets/scenes/marble`` that actually loads cleanly
-    # — the other ``.usda`` variants in that dir reference broken NuRec
-    # field paths (``MarbleKitchen/MarbleKitchen/gauss/gauss/...``) and spam
-    # the resolver. Override via ``--marble-scene PATH`` if you add new
-    # assets later. Set to ``None`` to skip the marble background entirely.
+    # Visible marble BG (NuRec splat) for rgb. The polygon collider sibling
+    # is auto-attached as the depth proxy via two-pass capture: the
+    # rasterized depth pass cannot intersect a NuRec volume, so we hide
+    # the collider during the rgb pass (NuRec only) and show it during a
+    # second render call to grab depth from the polygon mesh. Collider
+    # geometry is too simplified for visual rendering, so it stays out of
+    # rgb. Override via ``--marble-scene PATH`` if you swap assets.
     marble_scene: Path | None = Path("assets/scenes/marble/MarbleKitchen.usdz")
 
 
@@ -111,14 +112,20 @@ def _capture_env(env_name: str, cfg: ArtifactCaptureConfig) -> dict:
             chosen = Path(cfg.marble_scene).expanduser().resolve()
             if not chosen.exists():
                 raise FileNotFoundError(f"marble_scene asset not found: {chosen}")
-            collider = _find_collider_for(chosen)
+            # If the BG itself is already a polygon collider mesh, don't
+            # attach a second one — the BG IS the depth proxy. Otherwise
+            # (e.g. NuRec asset) look for a sibling ``*_collider.usd`` that
+            # acts as the depth proxy via the two-pass capture path.
+            is_collider_bg = "collider" in chosen.stem.lower()
+            collider = None if is_collider_bg else _find_collider_for(chosen)
             runtime.set_background_scene(chosen, collider_path=collider)
             marble_loaded = True
-            print(
-                f"[artifact:{env_name}] marble background: {chosen}"
-                + (f"  (collider: {collider.name})" if collider else "  (no collider found)"),
-                flush=True,
+            mode_note = (
+                "  (polygon BG; rgb+depth in one pass)"
+                if is_collider_bg
+                else (f"  (collider: {collider.name})" if collider else "  (no collider found)")
             )
+            print(f"[artifact:{env_name}] marble background: {chosen}{mode_note}", flush=True)
         return _hemispheric_snapshot(runtime, runtime.env, output_dir, cfg, env_name)
     finally:
         if marble_loaded:
@@ -211,14 +218,9 @@ def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: ArtifactCaptureCo
                 positions=pos_t, orientations=quat_t, env_ids=env_ids, convention="opengl",
             )
 
-            # ---- rgb pass ----
+            # ---- rgb pass: collider hidden so rgb is NuRec-only ----
             if has_collider:
                 runtime.set_collider_for_depth_pass(False)
-                # path tracing should already be on from the loop entry; no
-                # need to toggle every iteration unless the depth pass below
-                # turned it off.
-                if cfg.use_path_tracing:
-                    runtime.set_path_tracing(True, spp=cfg.spp)
             env.sim.render()
             env.scene.update(0.0)
 
@@ -234,27 +236,22 @@ def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: ArtifactCaptureCo
                     rgb = rgb * 255.0
                 rgb = np.clip(rgb, 0, 255).astype(np.uint8)
 
+            # ---- depth pass: collider visible so the rasterized depth
+            # render product intersects the polygon mesh. Path tracing
+            # stays on (no expensive re-init); the rgb readback this pass
+            # produces is dirty (PT compositing collider + NuRec) but we
+            # don't read it. NuRec doesn't write rasterized depth so it
+            # cannot pollute the depth buffer. ----
             depth_arr = None
             if has_collider:
-                # ---- depth pass ----
-                # Hide NuRec, show collider, drop path tracing (rasterized
-                # depth runs much faster and we don't need PT for distance).
                 runtime.set_collider_for_depth_pass(True)
-                if cfg.use_path_tracing:
-                    runtime.set_path_tracing(False)
                 env.sim.render()
                 env.scene.update(0.0)
-                depth_t = out.get("distance_to_image_plane")
-                if depth_t is None:
-                    depth_t = out.get("depth")
-                if depth_t is not None:
-                    depth_arr = depth_t[0].detach().cpu().numpy().astype(np.float32).squeeze()
-            else:
-                depth_t = out.get("distance_to_image_plane")
-                if depth_t is None:
-                    depth_t = out.get("depth")
-                if depth_t is not None:
-                    depth_arr = depth_t[0].detach().cpu().numpy().astype(np.float32).squeeze()
+            depth_t = out.get("distance_to_image_plane")
+            if depth_t is None:
+                depth_t = out.get("depth")
+            if depth_t is not None:
+                depth_arr = depth_t[0].detach().cpu().numpy().astype(np.float32).squeeze()
 
             K = base_cam.data.intrinsic_matrices[0].detach().cpu().numpy().astype(np.float32)
             # Build the camera-to-world matrix directly from our look-at math
