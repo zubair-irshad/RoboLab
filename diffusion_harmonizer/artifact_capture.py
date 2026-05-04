@@ -60,10 +60,13 @@ class ArtifactCaptureConfig:
     num_envs: int = 1
     physx_buffer_scale: float = 0.1
     use_path_tracing: bool = True
-    # Marble (3D) scenes referenced as the visible background instead of dome
-    # HDRIs, to test the hypothesis that latlong HDR projection hurts
-    # background rendering quality. Set to () to fall back to plain HDRI.
-    marble_scene_roots: tuple[str, ...] = ("assets/scenes/marble",)
+    # The canonical marble NuRec scene used as the visible background. Only
+    # one asset ships in ``assets/scenes/marble`` that actually loads cleanly
+    # — the other ``.usda`` variants in that dir reference broken NuRec
+    # field paths (``MarbleKitchen/MarbleKitchen/gauss/gauss/...``) and spam
+    # the resolver. Override via ``--marble-scene PATH`` if you add new
+    # assets later. Set to ``None`` to skip the marble background entirely.
+    marble_scene: Path | None = Path("assets/scenes/marble/MarbleKitchen.usdz")
 
 
 def run_artifact_capture(env_names: list[str], cfg: ArtifactCaptureConfig) -> dict:
@@ -104,9 +107,10 @@ def _capture_env(env_name: str, cfg: ArtifactCaptureConfig) -> dict:
     output_dir = cfg.output_root / env_name / "01_artifacts_correction"
     marble_loaded = False
     try:
-        marble_scenes = _gather_marble_scenes(cfg.marble_scene_roots)
-        if marble_scenes:
-            chosen = random.Random(cfg.seed + hash(env_name)).choice(marble_scenes)
+        if cfg.marble_scene is not None:
+            chosen = Path(cfg.marble_scene).expanduser().resolve()
+            if not chosen.exists():
+                raise FileNotFoundError(f"marble_scene asset not found: {chosen}")
             collider = _find_collider_for(chosen)
             runtime.set_background_scene(chosen, collider_path=collider)
             marble_loaded = True
@@ -149,22 +153,6 @@ def _find_collider_for(marble_path: Path) -> Path | None:
         if c.exists() and c.is_file():
             return c.resolve()
     return None
-
-
-def _gather_marble_scenes(roots) -> list[Path]:
-    suffixes = {".usda", ".usdc", ".usdz", ".usd"}
-    out: list[Path] = []
-    for root in roots:
-        path = Path(root)
-        if not path.exists():
-            continue
-        for candidate in path.rglob("*"):
-            if not candidate.is_file() or candidate.suffix.lower() not in suffixes:
-                continue
-            if "collider" in candidate.stem.lower():
-                continue
-            out.append(candidate.resolve())
-    return sorted(out)
 
 
 def _hemispheric_snapshot(runtime, env, output_dir: Path, cfg: ArtifactCaptureConfig, env_name: str) -> dict:

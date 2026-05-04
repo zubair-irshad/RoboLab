@@ -464,27 +464,29 @@ class HarmonizerRuntime:
         self,
         visible: bool,
         collider_prim_path: str = "/World/MarbleBackgroundCollider",
-        nurec_prim_path: str = "/World/MarbleBackground",
+        nurec_prim_path: str = "/World/MarbleBackground",  # kept for API compat; unused
     ) -> None:
-        """Flip visibility for two-pass capture.
+        """Flip the polygonal collider's visibility between rgb and depth passes.
 
-        ``visible=False`` (rgb pass): collider hidden, NuRec visible.
-        ``visible=True``  (depth pass): collider visible, NuRec hidden.
+        ``visible=False`` (rgb pass): collider invisible — rgb is NuRec only.
+        ``visible=True``  (depth pass): collider visible — rasterized depth
+        intersects the polygon mesh.
 
-        Both prims keep ``purpose=default``; we only toggle the visibility
-        attribute, which the rasterizer and path tracer both honor.
+        We deliberately do NOT toggle the NuRec subtree's visibility. Hiding
+        NuRec via ``visibility=invisible`` triggers the OmniNuRec field-asset
+        resolver to re-query the field data on every show/hide cycle, which
+        spams ``NuRecFieldAsset::loadAssetData: No asset path found`` errors
+        and stalls capture. Leaving NuRec permanently visible is fine because
+        NuRec is volumetric and doesn't write to the rasterized depth render
+        product anyway — depth-pass rgb is path-traced garbage (we ignore
+        it), but rasterized depth correctly reports the collider distance.
         """
         from pxr import UsdGeom
 
         col = self.stage.GetPrimAtPath(collider_prim_path)
-        nu = self.stage.GetPrimAtPath(nurec_prim_path)
         if col.IsValid():
             UsdGeom.Imageable(col).GetVisibilityAttr().Set(
                 UsdGeom.Tokens.inherited if visible else UsdGeom.Tokens.invisible
-            )
-        if nu.IsValid():
-            UsdGeom.Imageable(nu).GetVisibilityAttr().Set(
-                UsdGeom.Tokens.invisible if visible else UsdGeom.Tokens.inherited
             )
 
     def set_distant_light(

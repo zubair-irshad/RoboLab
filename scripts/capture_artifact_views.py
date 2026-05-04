@@ -54,6 +54,11 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--num-envs", type=int, default=1)
 parser.add_argument("--physx-buffer-scale", type=float, default=0.1)
 parser.add_argument("--no-headless", dest="headless_override", action="store_false", default=True)
+parser.add_argument("--marble-scene", default=None,
+                    help="Pin a specific marble USD as the BG (skips random pick across "
+                         "marble_scene_roots). Use this to avoid landing on assets with broken "
+                         "NuRec field references like marble3.usda. Recommended: "
+                         "assets/scenes/marble/marblekitchen.usda")
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, _ = parser.parse_known_args()
@@ -100,6 +105,7 @@ def main() -> None:
         num_envs=args_cli.num_envs,
         physx_buffer_scale=args_cli.physx_buffer_scale,
         use_path_tracing=args_cli.use_path_tracing,
+        marble_scene=Path(args_cli.marble_scene) if args_cli.marble_scene else None,
     )
     print(f"[artifact] capturing {len(env_names)} env(s) -> {cfg.output_root}", flush=True)
     summary = run_artifact_capture(env_names, cfg)
