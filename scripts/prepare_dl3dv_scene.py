@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--target-camera-height-m", type=float, default=1.5)
 
+    p.add_argument(
+        "--low-res",
+        action="store_true",
+        help="download images_4/ (960x540) only — few hundred MB instead of "
+             "several GB. cameras.txt is rescaled by 0.25 to match.",
+    )
     p.add_argument("--skip-download", action="store_true")
     p.add_argument("--skip-train", action="store_true")
     p.add_argument("--skip-mesh", action="store_true")
@@ -94,7 +100,7 @@ def _resolve_scene_ref(args: argparse.Namespace) -> DL3DVSceneRef:
         ref = DL3DVSceneRef(args.scene_hash, scene_root, colmap)
         ref.assert_colmap_layout()
         return ref
-    return download_scene(args.scene_hash, args.cache_dir)
+    return download_scene(args.scene_hash, args.cache_dir, low_res=args.low_res)
 
 
 def main() -> int:

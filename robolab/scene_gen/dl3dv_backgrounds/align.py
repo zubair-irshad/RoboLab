@@ -86,14 +86,62 @@ def _quat_to_R(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
     )
 
 
+def _parse_colmap_images_bin(path: Path) -> np.ndarray:
+    """Parse COLMAP images.bin → (R_world_cam, t_world_cam) stacks.
+
+    Format (from COLMAP's read_write_model.py, BSD-licensed):
+
+        uint64  num_images
+        for each image:
+            uint32  image_id
+            double  qw, qx, qy, qz
+            double  tx, ty, tz
+            uint32  camera_id
+            char[]  name (null-terminated)
+            uint64  num_points2D
+            (double x, double y, int64 point3D_id) * num_points2D
+    """
+    import struct
+
+    rotations: list[np.ndarray] = []
+    translations: list[np.ndarray] = []
+    with path.open("rb") as f:
+        (num_images,) = struct.unpack("<Q", f.read(8))
+        for _ in range(num_images):
+            f.read(4)  # image_id
+            qw, qx, qy, qz = struct.unpack("<4d", f.read(32))
+            tx, ty, tz = struct.unpack("<3d", f.read(24))
+            f.read(4)  # camera_id
+            # name: read until null byte
+            name_chars: list[bytes] = []
+            while True:
+                ch = f.read(1)
+                if ch == b"\x00" or ch == b"":
+                    break
+                name_chars.append(ch)
+            (num_points2d,) = struct.unpack("<Q", f.read(8))
+            f.seek(num_points2d * 24, 1)  # skip 2D-3D matches
+            R_cw = _quat_to_R(qw, qx, qy, qz)
+            t_cw = np.array([tx, ty, tz])
+            R_wc = R_cw.T
+            t_wc = -R_wc @ t_cw
+            rotations.append(R_wc)
+            translations.append(t_wc)
+    if not rotations:
+        raise ValueError(f"no image entries parsed from {path}")
+    return np.stack(rotations), np.stack(translations)
+
+
 def _read_images_metadata(colmap_source_path: Path) -> tuple[np.ndarray, np.ndarray]:
-    txt = colmap_source_path / "sparse" / "0" / "images.txt"
+    sparse0 = colmap_source_path / "sparse" / "0"
+    txt = sparse0 / "images.txt"
     if txt.is_file():
         return _parse_colmap_images_txt(txt)
+    binp = sparse0 / "images.bin"
+    if binp.is_file():
+        return _parse_colmap_images_bin(binp)
     raise FileNotFoundError(
-        f"images.txt not found under {colmap_source_path}/sparse/0/. "
-        f"DL3DV scenes ship as text COLMAP — if you have binary, run "
-        f"`colmap model_converter --input_path sparse/0 --output_path sparse/0 --output_type TXT`"
+        f"neither images.txt nor images.bin found under {sparse0}"
     )
 
 
