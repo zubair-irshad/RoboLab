@@ -69,11 +69,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-camera-height-m", type=float, default=1.5)
 
     p.add_argument(
-        "--subset",
-        choices=("gaussian_splat", "nerfstudio"),
-        default="gaussian_splat",
-        help="which subtree to pull from DL3DV-Benchmark (default: "
-             "gaussian_splat — COLMAP-ready for fast-pgsr).",
+        "--images-variant",
+        choices=("images", "images_2", "images_4", "images_8"),
+        default="images_4",
+        help="which image resolution to pull. cameras in sparse/ are "
+             "calibrated for full-res images/; we auto-rescale to match.",
     )
     p.add_argument("--skip-download", action="store_true")
     p.add_argument("--skip-train", action="store_true")
@@ -96,12 +96,32 @@ def _resolve_scene_ref(args: argparse.Namespace) -> DL3DVSceneRef:
             raise FileNotFoundError(
                 f"--skip-download but no cached scene at {scene_root}"
             )
-        from robolab.scene_gen.dl3dv_backgrounds.download import _resolve_colmap_source
+        # Even when skipping the network fetch, re-run the local fixups
+        # (images symlink + camera rescale) so an incomplete prior cache
+        # gets normalized.
+        from robolab.scene_gen.dl3dv_backgrounds.download import (
+            _autorescale_cameras_to_actual_image_dim,
+            _resolve_colmap_source,
+        )
+        gs = scene_root / "gaussian_splat"
+        if gs.is_dir() and args.images_variant != "images":
+            target = gs / "images"
+            variant_dir = gs / args.images_variant
+            if variant_dir.is_dir():
+                if target.is_symlink() and target.readlink().name != args.images_variant:
+                    target.unlink()
+                if not target.exists():
+                    target.symlink_to(args.images_variant)
+                    print(f"[prepare] symlinked {target} -> {args.images_variant}")
+        if gs.is_dir():
+            _autorescale_cameras_to_actual_image_dim(gs)
         colmap = _resolve_colmap_source(scene_root)
         ref = DL3DVSceneRef(args.scene_hash, scene_root, colmap)
         ref.assert_colmap_layout()
         return ref
-    return download_scene(args.scene_hash, args.cache_dir, subset=args.subset)
+    return download_scene(
+        args.scene_hash, args.cache_dir, images_variant=args.images_variant
+    )
 
 
 def main() -> int:
