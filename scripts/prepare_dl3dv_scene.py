@@ -69,10 +69,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-camera-height-m", type=float, default=1.5)
 
     p.add_argument(
-        "--low-res",
-        action="store_true",
-        help="download images_4/ (960x540) only — few hundred MB instead of "
-             "several GB. cameras.txt is rescaled by 0.25 to match.",
+        "--subset",
+        choices=("gaussian_splat", "nerfstudio"),
+        default="gaussian_splat",
+        help="which subtree to pull from DL3DV-Benchmark (default: "
+             "gaussian_splat — COLMAP-ready for fast-pgsr).",
     )
     p.add_argument("--skip-download", action="store_true")
     p.add_argument("--skip-train", action="store_true")
@@ -100,7 +101,7 @@ def _resolve_scene_ref(args: argparse.Namespace) -> DL3DVSceneRef:
         ref = DL3DVSceneRef(args.scene_hash, scene_root, colmap)
         ref.assert_colmap_layout()
         return ref
-    return download_scene(args.scene_hash, args.cache_dir, low_res=args.low_res)
+    return download_scene(args.scene_hash, args.cache_dir, subset=args.subset)
 
 
 def main() -> int:
