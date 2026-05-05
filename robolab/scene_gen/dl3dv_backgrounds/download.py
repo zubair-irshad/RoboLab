@@ -113,25 +113,26 @@ def _filter_files_for_scene(
 ) -> list[str]:
     """Pick the files we actually want from a scene's filelist.
 
-    Always include: ``colmap/**`` (or ``colmaps/**``) — small, needed for
-    poses + sparse points + (optionally) database.
-    Images: full ``images/`` unless ``low_res``, in which case ``images_4/``.
+    Structure-agnostic filter (works whether paths are
+    ``<hash>/images_4/...`` or ``images_4/...``):
 
-    Skip: ``input/`` (raw camera frames, not used by GS).
+      - skip files inside an ``input`` directory (raw camera frames)
+      - if ``low_res``: skip files inside ``images/`` or ``images_8/``
+        directories — keep ``images_4/`` and everything else (colmap
+        data, transforms.json, etc).
+
+    Note: we check directory *parts*, not substrings, so the COLMAP file
+    ``colmap/sparse/0/images.bin`` is correctly kept (the substring
+    check used by DL3DV's official downloader is buggy here).
     """
     chosen: list[str] = []
-    images_subdir = "images_4" if low_res else "images"
     for f in all_files:
-        # always include colmap data
-        if f.startswith(f"colmap/") or f.startswith(f"colmaps/"):
-            chosen.append(f)
+        parts = Path(f).parts
+        if "input" in parts:
             continue
-        # images
-        if f.startswith("images/") or f.startswith("images_4/") or f.startswith("images_8/"):
-            if f.startswith(images_subdir + "/"):
-                chosen.append(f)
+        if low_res and ("images" in parts or "images_8" in parts):
             continue
-        # skip raw-frame input/, transforms.json variants, etc. for now
+        chosen.append(f)
     return chosen
 
 
@@ -285,11 +286,15 @@ def download_scene(
             f"scene hash {scene_hash} present in meta-csv but not in filelist.bin"
         )
     all_files = filelist[scene_hash]
+    print(f"[download] filelist sample (first 5 of {len(all_files)}):")
+    for f in all_files[:5]:
+        print(f"           {f}")
     chosen = _filter_files_for_scene(all_files, low_res=low_res)
     if not chosen:
+        sample = "\n  ".join(all_files[:10])
         raise RuntimeError(
-            f"no files selected for scene {scene_hash} "
-            f"(low_res={low_res}); raw filelist had {len(all_files)} entries"
+            f"no files selected for scene {scene_hash} (low_res={low_res}); "
+            f"filelist had {len(all_files)} entries. Sample paths:\n  {sample}"
         )
 
     print(
