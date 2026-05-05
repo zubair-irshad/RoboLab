@@ -92,7 +92,7 @@ def main() -> None:
     if not env_names:
         raise SystemExit("No envs matched the filter; check --task / --env / --tag.")
 
-    cfg = ArtifactCaptureConfig(
+    cfg_kwargs = dict(
         output_root=Path(args_cli.output_root),
         cameras=args_cli.cameras,
         radius_range=tuple(args_cli.radius_range),
@@ -105,8 +105,13 @@ def main() -> None:
         num_envs=args_cli.num_envs,
         physx_buffer_scale=args_cli.physx_buffer_scale,
         use_path_tracing=args_cli.use_path_tracing,
-        marble_scene=Path(args_cli.marble_scene) if args_cli.marble_scene else None,
     )
+    # Only pass marble_scene through when the user explicitly set --marble-scene;
+    # otherwise let the dataclass default (MarbleKitchen.usdz) take effect.
+    # Passing ``marble_scene=None`` would silently override the default.
+    if args_cli.marble_scene:
+        cfg_kwargs["marble_scene"] = Path(args_cli.marble_scene)
+    cfg = ArtifactCaptureConfig(**cfg_kwargs)
     print(f"[artifact] capturing {len(env_names)} env(s) -> {cfg.output_root}", flush=True)
     summary = run_artifact_capture(env_names, cfg)
     total = sum(env.get("num_views", 0) for env in summary["envs"].values())
