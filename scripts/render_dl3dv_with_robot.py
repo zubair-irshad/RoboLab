@@ -82,6 +82,22 @@ parser.add_argument("--no-path-tracing", dest="use_path_tracing",
                     action="store_false", default=True)
 parser.add_argument("--output-subdir", default="dl3dv_render_check")
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument(
+    "--gs-usdz", type=Path, default=None,
+    help="path to a GS USDZ from 3DGUT (the photoreal background). "
+         "Default: <scene-dir>/gaussians.usdz if it exists. When provided, "
+         "the GS is the rgb visual and the aligned mesh becomes the depth "
+         "collider only (two-pass capture). When absent, the mesh is used "
+         "as both — non-photoreal but always works.",
+)
+parser.add_argument(
+    "--no-gs", action="store_true",
+    help="force mesh-only rendering even if a GS USDZ exists.",
+)
+parser.add_argument(
+    "--no-depth", action="store_true",
+    help="skip the depth pass (rgb only — faster).",
+)
 parser.add_argument("--no-headless", dest="headless_override",
                     action="store_false", default=True)
 parser.add_argument("--num-envs", type=int, default=1)
@@ -345,18 +361,30 @@ def _detect_task_floor_z(
 
 # ---- main flow --------------------------------------------------------------
 
+def _resolve_gs_usdz(scene_dir: Path) -> Path | None:
+    """Honor --gs-usdz / --no-gs / default to <scene-dir>/gaussians.usdz."""
+    if args_cli.no_gs:
+        return None
+    if args_cli.gs_usdz is not None:
+        p = args_cli.gs_usdz.resolve()
+        if not p.is_file():
+            raise FileNotFoundError(f"--gs-usdz {p} does not exist")
+        return p
+    auto = scene_dir / "gaussians.usdz"
+    return auto.resolve() if auto.is_file() else None
+
+
 def main() -> int:
     scene_dir = args_cli.scene_dir.resolve()
     placements_path = scene_dir / "placements.json"
-    bg_usd_path = scene_dir / "mesh_aligned.usd"
+    mesh_usd_path = scene_dir / "mesh_aligned.usd"
+    metadata_path = scene_dir / "metadata.json"
     if not placements_path.is_file():
-        raise FileNotFoundError(
-            f"missing {placements_path}; run sample_dl3dv_placements.py first"
-        )
-    if not bg_usd_path.is_file():
-        raise FileNotFoundError(
-            f"missing {bg_usd_path}; run dl3dv_mesh_to_usd.py first"
-        )
+        raise FileNotFoundError(f"missing {placements_path}")
+    if not mesh_usd_path.is_file():
+        raise FileNotFoundError(f"missing {mesh_usd_path}")
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"missing {metadata_path}")
 
     placements = json.loads(placements_path.read_text())["placements"]
     if args_cli.placement_idx >= len(placements):
@@ -370,60 +398,85 @@ def main() -> int:
         f"x={pl['x_m']:.2f}, y={pl['y_m']:.2f}, yaw={np.degrees(pl['yaw_rad']):.1f}°"
     )
 
+    metadata = json.loads(metadata_path.read_text())
+    M_align = np.asarray(metadata["world_from_colmap_4x4"], dtype=np.float64)
+    print(f"[render] world_from_colmap_4x4: scale = {metadata['scale']:.4f}")
+
+    gs_usdz = _resolve_gs_usdz(scene_dir)
+    use_gs = gs_usdz is not None
+    print(f"[render] mode: {'GS-photoreal + mesh-collider' if use_gs else 'mesh-only'}")
+    if use_gs:
+        print(f"[render] GS USDZ: {gs_usdz}")
+
     runtime = HarmonizerRuntime(
         env_name=args_cli.task,
         seed=args_cli.seed,
         device="cuda:0",
         num_envs=args_cli.num_envs,
         physx_buffer_scale=0.1,
-        enable_depth=False,
+        # Need depth for the depth pass when capturing it.
+        enable_depth=not args_cli.no_depth,
     )
     env = runtime.env
 
-    bg_prim_path = "/World/DL3DVScene"
+    # Reference both prims via the runtime helper. The visual prim is
+    # whatever's photoreal (GS USDZ if available, else the mesh). The
+    # collider prim is the aligned mesh — its visibility is toggled per
+    # pass by ``runtime.set_collider_for_depth_pass``.
+    bg_visual_path = mesh_usd_path if not use_gs else gs_usdz
     runtime.set_background_scene(
-        bg_usd_path, prim_path=bg_prim_path,
-        # Same mesh acts as collider (it's polygons, not NuRec)
-        collider_path=bg_usd_path,
-        collider_visible_to_path_tracer=True,
+        bg_visual_path,
+        prim_path="/World/MarbleBackground",
+        collider_path=mesh_usd_path,
+        # When in mesh-only mode the visual IS already a polygon, so we
+        # don't need to keep the collider visible during rgb (it'd just
+        # double-render). When in GS mode, the collider stays hidden
+        # during rgb (NuRec only) and is toggled on for the depth pass.
+        collider_visible_to_path_tracer=False,
     )
+
     if args_cli.bg_z_offset is not None:
         bg_z_offset = float(args_cli.bg_z_offset)
         print(f"[render] using user-supplied bg_z_offset = {bg_z_offset:+.3f} m")
     else:
         detected = _detect_task_floor_z(runtime.stage)
-        if detected is not None:
-            bg_z_offset = detected
-        else:
-            bg_z_offset = float(args_cli.bg_z_offset_fallback)
+        bg_z_offset = (
+            detected if detected is not None
+            else float(args_cli.bg_z_offset_fallback)
+        )
+        if detected is None:
             print(f"[render] auto-detect failed; using fallback {bg_z_offset:+.3f} m")
-    M = _build_bg_transform(
+
+    # Placement transform (alignment-frame → world). Same shape regardless
+    # of which visual we're using.
+    M_place = _build_bg_transform(
         pl["x_m"], pl["y_m"], pl["yaw_rad"], z_offset=bg_z_offset,
     )
-    print(f"[render] computed BG transform M (numpy convention):")
-    for row in M:
-        print(f"           [{row[0]: 8.4f} {row[1]: 8.4f} {row[2]: 8.4f} {row[3]: 8.4f}]")
-    _set_bg_transform(runtime.stage, bg_prim_path, M)
-    _verify_bg_transform(runtime.stage, bg_prim_path, M)
-    print(
-        f"[render] BG transformed: placement_xy → world origin, "
-        f"yaw zeroed, z_offset = {bg_z_offset:+.3f} m"
-    )
 
-    # Also print the BG prim's COLLIDER sibling's transform — same matrix
-    # should apply to it. If the collider has its own (uncoupled) transform,
-    # depth and visual won't agree. set_background_scene uses
-    # /World/MarbleBackgroundCollider for the collider.
-    collider_path = "/World/MarbleBackgroundCollider"
-    if runtime.stage.GetPrimAtPath(collider_path).IsValid():
-        _set_bg_transform(runtime.stage, collider_path, M)
-        _verify_bg_transform(runtime.stage, collider_path, M)
-        print(f"[render] applied same BG transform to collider {collider_path}")
+    # The mesh USD is already in aligned-world frame (we baked R + t + s
+    # during prepare_dl3dv_scene), so the mesh prim only needs M_place.
+    # The GS USDZ is in raw COLMAP frame (3DGUT doesn't pre-align), so the
+    # GS prim needs M_place ∘ M_align.
+    visual_prim_path = "/World/MarbleBackground"
+    collider_prim_path = "/World/MarbleBackgroundCollider"
+    if use_gs:
+        M_visual = M_place @ M_align
+    else:
+        M_visual = M_place
+    M_collider = M_place
+
+    print(f"[render] visual transform M (numpy):")
+    for row in M_visual:
+        print(f"           [{row[0]: 8.3f} {row[1]: 8.3f} {row[2]: 8.3f} {row[3]: 8.3f}]")
+    _set_bg_transform(runtime.stage, visual_prim_path, M_visual)
+    _verify_bg_transform(runtime.stage, visual_prim_path, M_visual)
+    if runtime.stage.GetPrimAtPath(collider_prim_path).IsValid():
+        _set_bg_transform(runtime.stage, collider_prim_path, M_collider)
+        _verify_bg_transform(runtime.stage, collider_prim_path, M_collider)
 
     if args_cli.use_path_tracing:
         runtime.set_path_tracing(True, spp=args_cli.spp)
 
-    # Pick the env-side camera we'll teleport
     sensors = list(getattr(env.scene, "sensors", {}).keys())
     cam_name = next((c for c in _CAMERA_CANDIDATES if c in sensors), None)
     if cam_name is None:
@@ -432,9 +485,21 @@ def main() -> int:
     base_cam = env.scene[cam_name]
     env_ids = torch.tensor([0], device=env.device, dtype=torch.long)
 
-    out_dir = scene_dir / args_cli.output_subdir / args_cli.task / f"placement_{args_cli.placement_idx:02d}"
+    out_dir = (
+        scene_dir / args_cli.output_subdir / args_cli.task /
+        f"placement_{args_cli.placement_idx:02d}"
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "placement.json").write_text(json.dumps(pl, indent=2))
+    (out_dir / "render_meta.json").write_text(json.dumps({
+        "task": args_cli.task,
+        "use_gs": use_gs,
+        "gs_usdz": str(gs_usdz) if gs_usdz else None,
+        "bg_z_offset_m": bg_z_offset,
+        "world_from_colmap_4x4": M_align.tolist(),
+        "M_place": M_place.tolist(),
+        "M_visual": M_visual.tolist(),
+    }, indent=2))
 
     eyes = _fibonacci_hemisphere_eyes(
         args_cli.num_views, args_cli.radius_range,
@@ -450,16 +515,39 @@ def main() -> int:
             positions=pos_t, orientations=quat_t,
             env_ids=env_ids, convention="opengl",
         )
+
+        # ---- RGB pass: collider hidden so rgb is GS-only (or mesh-only) ----
+        if use_gs:
+            runtime.set_collider_for_depth_pass(False)
         env.sim.render()
         env.scene.update(0.0)
         rgb = base_cam.data.output.get("rgb")
         if rgb is None:
-            print(f"[render] view {i:03d}: no rgb buffer (??), skipping")
+            print(f"[render] view {i:03d}: no rgb buffer; skipping")
             continue
         arr = rgb[0].detach().cpu().numpy()
         if arr.shape[-1] == 4:
             arr = arr[..., :3]
         save_png(out_dir / f"{i:04d}_rgb.png", arr)
+
+        # ---- depth pass (optional): collider visible, rasterized depth ----
+        if not args_cli.no_depth:
+            if use_gs:
+                runtime.set_collider_for_depth_pass(True)
+            env.sim.render()
+            env.scene.update(0.0)
+            depth_t = base_cam.data.output.get("distance_to_image_plane")
+            if depth_t is not None:
+                depth_np = depth_t[0].detach().cpu().numpy()
+                np.save(out_dir / f"{i:04d}_depth.npy", depth_np)
+            else:
+                if i == 0:
+                    print(
+                        "[render] WARN: no distance_to_image_plane buffer — "
+                        "depth not written. Was enable_depth=True?"
+                    )
+            if use_gs:
+                runtime.set_collider_for_depth_pass(False)
 
     print(f"[render] wrote {len(eyes)} views to {out_dir}")
     runtime.set_background_scene(None)
