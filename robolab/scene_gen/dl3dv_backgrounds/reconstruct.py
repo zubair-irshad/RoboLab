@@ -39,9 +39,14 @@ class FastPgsrConfig:
     extra_train_args: tuple[str, ...] = ()
     """Pass-through for branch-specific flags (e.g. --loss_thresh, --dense)."""
 
-    mesh_script: str = "extract_mesh.py"
-    """Name of the mesh-extraction entry point inside the FastGS repo.
-    fast-pgsr's TSDF-fusion mesh extractor; if upstream renames it, override here."""
+    # TSDF-fusion knobs (fed to render.py). PGSR defaults are voxel=2mm /
+    # max_depth=5m, which produce huge meshes for room-scale scenes — we
+    # default to 1cm voxels and 10m cutoff to keep meshes manageable while
+    # still good enough for robot-scene collision.
+    tsdf_voxel_size: float = 0.01
+    tsdf_max_depth: float = 10.0
+    tsdf_num_cluster: int = 1
+    use_depth_filter: bool = True
 
 
 def _conda_run(env: str, cwd: Path, cmd: list[str]) -> None:
@@ -92,37 +97,39 @@ def run_fast_pgsr(
         _conda_run(cfg.conda_env, repo, train_cmd)
 
     if extract_mesh:
-        mesh_entry = repo / cfg.mesh_script
-        if not mesh_entry.is_file():
-            raise FileNotFoundError(
-                f"mesh extractor not found at {mesh_entry} — fast-pgsr must "
-                f"expose one (default name: extract_mesh.py). Override via "
-                f"FastPgsrConfig.mesh_script."
-            )
-        mesh_cmd = [
-            "python", cfg.mesh_script,
+        # fast-pgsr does TSDF fusion inside render.py: it renders depth
+        # for each training view, then fuses → <model_path>/mesh/*.ply.
+        render_cmd = [
+            "python", "render.py",
             "--source_path", str(source_path),
             "--model_path", str(model_path),
             "--iteration", str(cfg.iterations),
+            "--skip_test",
+            "--max_depth", str(cfg.tsdf_max_depth),
+            "--voxel_size", str(cfg.tsdf_voxel_size),
+            "--num_cluster", str(cfg.tsdf_num_cluster),
         ]
-        _conda_run(cfg.conda_env, repo, mesh_cmd)
+        if cfg.use_depth_filter:
+            render_cmd.append("--use_depth_filter")
+        _conda_run(cfg.conda_env, repo, render_cmd)
 
-    # Discover the produced mesh. PGSR-style fusion typically writes
-    # something like <model_path>/train/ours_<iter>/fuse_post.ply or
-    # <model_path>/mesh.ply. We pick the most-recently-written .ply
-    # under model_path that isn't the input point cloud.
-    candidates = sorted(
-        (
-            p for p in model_path.rglob("*.ply")
-            if "input.ply" not in p.name and "point_cloud" not in p.parts
-        ),
+    # Prefer the post-processed (cluster-filtered) mesh; fall back to raw.
+    mesh_dir = model_path / "mesh"
+    for name in ("tsdf_fusion_post.ply", "tsdf_fusion.ply"):
+        candidate = mesh_dir / name
+        if candidate.is_file():
+            print(f"[fast-pgsr] mesh -> {candidate}")
+            return candidate
+
+    # Last-resort glob in case upstream renames things again.
+    fallback = sorted(
+        (p for p in model_path.rglob("*.ply") if "point_cloud" not in p.parts),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
-    if not candidates:
-        raise FileNotFoundError(
-            f"no mesh .ply produced under {model_path}; check fast-pgsr logs"
-        )
-    mesh_path = candidates[0]
-    print(f"[fast-pgsr] mesh -> {mesh_path}")
-    return mesh_path
+    if fallback:
+        print(f"[fast-pgsr] mesh (fallback discovery) -> {fallback[0]}")
+        return fallback[0]
+    raise FileNotFoundError(
+        f"no mesh .ply produced under {mesh_dir} — check render.py logs"
+    )
