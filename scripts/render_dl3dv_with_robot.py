@@ -61,6 +61,20 @@ parser.add_argument("--num-views", type=int, default=12)
 parser.add_argument("--radius-range", type=float, nargs=2, default=(1.2, 2.0))
 parser.add_argument("--center", type=float, nargs=3, default=(0.4, 0.0, 0.5),
                     help="hemisphere center in world frame (above the task table)")
+parser.add_argument(
+    "--bg-z-offset", type=float, default=None,
+    help="vertical shift applied to the DL3DV background (metres). If not "
+         "set (default), we auto-detect the task's floor z from the spawned "
+         "stage and use it — generalizes across tasks with different table "
+         "heights, no table at all, custom workdesks, etc. Pass an explicit "
+         "number (e.g. -0.75) to override the auto-detection.",
+)
+parser.add_argument(
+    "--bg-z-offset-fallback", type=float, default=-0.75,
+    help="fallback z-offset (m) used only when auto-detection finds nothing "
+         "useful (e.g. task has no static geometry). Default -0.75 "
+         "(Franka-on-table convention).",
+)
 parser.add_argument("--resolution", type=int, nargs=2, default=(720, 720))
 parser.add_argument("--spp", type=int, default=8,
                     help="path-tracing samples per pixel (lower = faster)")
@@ -90,6 +104,43 @@ from robolab.registrations.droid_jointpos.auto_env_registrations import (  # noq
     auto_register_droid_envs,
 )
 
+
+def _make_task_scan_tolerant() -> None:
+    """Skip tasks whose module-level import fails (e.g. missing assets).
+
+    Some RoboLab tasks call ``import_scene("foo.usda", ...)`` at class
+    definition time. If that asset isn't resolvable in the current env
+    (missing file, working-directory mismatch, asset-registry not yet
+    primed), the bare ``auto_register_droid_envs()`` call aborts on the
+    first failure and we never get to the task we actually want.
+
+    We wrap ``EnvironmentFactory.create_env_cfg`` so each broken task
+    just logs a warning and is skipped, leaving the rest registered.
+    """
+    try:
+        import robolab.core.environments.factory as factory_mod
+    except ImportError:
+        return
+    fac_cls = getattr(factory_mod, "EnvironmentFactory", None)
+    if fac_cls is None or not hasattr(fac_cls, "create_env_cfg"):
+        return
+    if getattr(fac_cls.create_env_cfg, "_dl3dv_tolerant", False):
+        return
+    _orig = fac_cls.create_env_cfg
+
+    def _tolerant(self, task, *args, **kwargs):
+        try:
+            return _orig(self, task, *args, **kwargs)
+        except Exception as exc:
+            print(f"[render] auto-register skipping {task!r}: "
+                  f"{type(exc).__name__}: {exc}")
+            return None
+
+    _tolerant._dl3dv_tolerant = True  # type: ignore[attr-defined]
+    fac_cls.create_env_cfg = _tolerant
+
+
+_make_task_scan_tolerant()
 auto_register_droid_envs()
 
 _CAMERA_CANDIDATES = (
@@ -160,17 +211,29 @@ def _look_at_quat_wxyz(eye, target, up=np.array([0, 0, 1.0])):
     return np.array([qw, qx, qy, qz])
 
 
-def _build_bg_transform(placement_x: float, placement_y: float,
-                        placement_yaw: float) -> np.ndarray:
-    """4×4 that maps DL3DV-aligned points so the placement lands at origin.
+def _build_bg_transform(
+    placement_x: float, placement_y: float,
+    placement_yaw: float, z_offset: float = 0.0,
+) -> np.ndarray:
+    """4×4 that maps DL3DV-aligned points so the placement lands above origin.
 
-    World point p_world = R_z(-yaw) · (p_dl3dv - [x, y, 0]).
+    World point p_world = R_z(-yaw) · (p_dl3dv - [x, y, 0]) + [0, 0, z_offset].
+
+    With ``z_offset = -table_height``, the DL3DV floor (z=0 in DL3DV frame)
+    ends up at z = -table_height in world — under the task's table top
+    (which is at world z=0). So:
+
+      - task table top → world z=0
+      - task table base → world z = -table_height = DL3DV floor
+      - DL3DV's natural-height furniture (sofas, etc.) → reasonable
+        world heights between DL3DV floor and ceiling
     """
     c, s = np.cos(-placement_yaw), np.sin(-placement_yaw)
     R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
     M = np.eye(4)
     M[:3, :3] = R
     M[:3, 3] = -R @ np.array([placement_x, placement_y, 0.0])
+    M[2, 3] += z_offset
     return M
 
 
@@ -182,6 +245,75 @@ def _set_bg_transform(stage, prim_path: str, M: np.ndarray) -> None:
     xformable.ClearXformOpOrder()
     op = xformable.AddTransformOp()
     op.Set(Gf.Matrix4d(*M.flatten().tolist()))
+
+
+def _detect_task_floor_z(
+    stage,
+    *,
+    env_root: str = "/World/envs/env_0",
+    robot_name_hints: tuple[str, ...] = ("robot", "franka", "panda", "ur5", "ur10", "arm"),
+    skip_dl3dv: bool = True,
+) -> float | None:
+    """Find the lowest z of static task geometry under ``env_root``.
+
+    Skips:
+      - the robot's prim subtree (heuristic: name contains a known hint)
+      - the DL3DV background prim (we don't want to detect ourselves)
+      - prims with empty / invalid bboxes
+
+    Returns the lowest world-frame z encountered, or ``None`` if nothing
+    useful was found. The caller decides what to do with ``None``
+    (typically: fall back to a sensible default).
+
+    Why this works as "task floor": RoboLab task scenes load workdesks /
+    breakfast tables / etc. as static USD references under the env. The
+    table's USD includes the table base sitting on the task's expected
+    floor, so the bbox's min-z is exactly the floor height in world
+    frame. For tasks with no table, the lowest static body is typically
+    a ground plane, which gives floor=0 — also correct.
+    """
+    from pxr import Usd, UsdGeom
+
+    env_prim = stage.GetPrimAtPath(env_root)
+    if not env_prim.IsValid():
+        return None
+    bbox_cache = UsdGeom.BBoxCache(
+        Usd.TimeCode.Default(),
+        [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+    )
+
+    lowest_z: float | None = None
+    skipped: list[str] = []
+    for child in env_prim.GetChildren():
+        name = child.GetName()
+        name_lc = name.lower()
+        if any(h in name_lc for h in robot_name_hints):
+            skipped.append(f"{name} (robot)")
+            continue
+        if skip_dl3dv and "dl3dv" in name_lc:
+            skipped.append(f"{name} (background)")
+            continue
+        try:
+            bbox = bbox_cache.ComputeWorldBound(child)
+            r = bbox.ComputeAlignedRange()
+            if r.IsEmpty():
+                continue
+            zmin = float(r.GetMin()[2])
+        except Exception:
+            continue
+        if lowest_z is None or zmin < lowest_z:
+            lowest_z = zmin
+            chosen_name = name
+
+    if lowest_z is None:
+        print(f"[render] task-floor auto-detect: no usable static prim under {env_root}; "
+              f"skipped={skipped}")
+        return None
+    print(
+        f"[render] task-floor auto-detect: lowest static prim = "
+        f"{chosen_name} @ z={lowest_z:.3f} m  (skipped robot/bg: {len(skipped)})"
+    )
+    return lowest_z
 
 
 # ---- main flow --------------------------------------------------------------
@@ -228,9 +360,24 @@ def main() -> int:
         collider_path=bg_usd_path,
         collider_visible_to_path_tracer=True,
     )
-    M = _build_bg_transform(pl["x_m"], pl["y_m"], pl["yaw_rad"])
+    if args_cli.bg_z_offset is not None:
+        bg_z_offset = float(args_cli.bg_z_offset)
+        print(f"[render] using user-supplied bg_z_offset = {bg_z_offset:+.3f} m")
+    else:
+        detected = _detect_task_floor_z(runtime.stage)
+        if detected is not None:
+            bg_z_offset = detected
+        else:
+            bg_z_offset = float(args_cli.bg_z_offset_fallback)
+            print(f"[render] auto-detect failed; using fallback {bg_z_offset:+.3f} m")
+    M = _build_bg_transform(
+        pl["x_m"], pl["y_m"], pl["yaw_rad"], z_offset=bg_z_offset,
+    )
     _set_bg_transform(runtime.stage, bg_prim_path, M)
-    print(f"[render] BG transformed: placement_xy → world origin, yaw zeroed")
+    print(
+        f"[render] BG transformed: placement_xy → world origin, "
+        f"yaw zeroed, z_offset = {bg_z_offset:+.3f} m"
+    )
 
     if args_cli.use_path_tracing:
         runtime.set_path_tracing(True, spp=args_cli.spp)

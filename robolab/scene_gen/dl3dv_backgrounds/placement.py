@@ -30,15 +30,29 @@ from .align import _ransac_floor_plane
 
 @dataclass
 class FootprintSpec:
-    """Rectangle the task occupies on the floor before yaw rotation."""
-    length_m: float = 1.5   # along +X
+    """3D volume the task occupies, before yaw rotation.
+
+    The robot's actual working volume is a column above the placement:
+    table footprint (length × width) at the base, sweeping up to the
+    full reach of the arm. Both clearance_m (vertical extent) and
+    robot_reach_m (lateral margin around the footprint for the arm)
+    matter for whether a placement is collision-free.
+    """
+    length_m: float = 1.5   # along +X (task footprint at floor level)
     width_m: float = 1.0    # along +Y
-    clearance_m: float = 1.5  # vertical clearance above the floor we need
+    clearance_m: float = 2.5  # vertical reach of the robot column
+    robot_reach_m: float = 0.85  # lateral arm reach beyond the footprint edge
 
     @property
-    def half_diag_m(self) -> float:
-        """Half-diagonal — outer-radius for circular conservative erosion."""
-        return 0.5 * float(np.hypot(self.length_m, self.width_m))
+    def erosion_radius_m(self) -> float:
+        """Conservative outer radius for free-space erosion.
+
+        ``half_diag`` covers any rotation of the rectangle; adding
+        ``robot_reach`` keeps the arm's swept lateral volume clear of
+        obstacles regardless of yaw.
+        """
+        half_diag = 0.5 * float(np.hypot(self.length_m, self.width_m))
+        return half_diag + max(0.0, self.robot_reach_m)
 
 
 @dataclass
@@ -168,10 +182,12 @@ def sample_placements(
         clearance_m=footprint.clearance_m,
     )
 
-    # Erode by an outer-radius equal to half the footprint diagonal — that
-    # guarantees no rotation of the rectangle can hit an obstacle. Slightly
-    # conservative vs an angle-aware test, but cheap and obviously correct.
-    erode_cells = int(np.ceil(footprint.half_diag_m / cell_size_m))
+    # Erode by an outer-radius that covers both rotation of the rectangle
+    # AND the robot's lateral reach beyond the footprint edge. This is
+    # conservative (a Minkowski sum approximation), but cheap and ensures
+    # the robot can sweep its working volume without hitting walls or
+    # furniture regardless of yaw.
+    erode_cells = int(np.ceil(footprint.erosion_radius_m / cell_size_m))
     occ_eroded = _erode(occ, erode_cells)
     free = ~occ_eroded
 

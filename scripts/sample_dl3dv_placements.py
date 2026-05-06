@@ -122,10 +122,13 @@ def main() -> int:
                    help="task footprint length along +X (metres)")
     p.add_argument("--footprint-wid", type=float, default=1.0,
                    help="task footprint width along +Y (metres)")
-    p.add_argument("--clearance", type=float, default=1.5,
-                   help="vertical clearance above the floor (metres)")
+    p.add_argument("--clearance", type=float, default=2.5,
+                   help="vertical robot-column clearance (m). Default 2.5 "
+                        "covers a Franka with full reach above the table.")
     p.add_argument("--robot-reach", type=float, default=0.85,
-                   help="robot reach disk radius drawn for context")
+                   help="lateral arm reach beyond the footprint edge — used "
+                        "BOTH as the visualization disk and as the erosion "
+                        "margin when sampling. Default 0.85 (Franka).")
     p.add_argument("--cell-size", type=float, default=0.05,
                    help="occupancy grid cell size (metres)")
     p.add_argument("--yaw", choices=("face_centroid", "random"),
@@ -143,6 +146,7 @@ def main() -> int:
         length_m=args.footprint_len,
         width_m=args.footprint_wid,
         clearance_m=args.clearance,
+        robot_reach_m=args.robot_reach,
     )
     placements = sample_placements(
         aligned_mesh_path=aligned_mesh,
