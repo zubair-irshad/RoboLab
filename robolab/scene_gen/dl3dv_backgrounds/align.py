@@ -193,7 +193,8 @@ def _ransac_floor_plane(
     max_normal_dev_deg: float = 25.0,
     max_iters: int = 400,
     rng_seed: int = 0,
-) -> tuple[float, float]:
+    return_mask: bool = False,
+) -> tuple[float, float] | tuple[float, float, np.ndarray]:
     """Find the floor z + inlier fraction by RANSAC plane fit.
 
     Restricts to vertices in the lower ``lower_pct`` of z so we don't
@@ -206,24 +207,37 @@ def _ransac_floor_plane(
     high values (>0.4) indicate a strong, dense floor; low values
     indicate the lower portion is dominated by floaters.
 
+    If ``return_mask`` is True, also returns a boolean array of length
+    ``len(vertices_aligned)`` flagging which input vertices are floor
+    inliers (i.e. in the lower portion AND within ``inlier_thresh`` of
+    the winning plane).
+
     Robust to TSDF "shadow" artifacts: those are sparse and unaligned,
     so they accumulate few inliers and lose to the real floor.
     """
     z = vertices_aligned[:, 2]
     z_thresh = float(np.percentile(z, lower_pct))
-    candidates = vertices_aligned[z <= z_thresh]
-    if len(candidates) < 100:
+    lower_mask = z <= z_thresh
+    candidates_full = vertices_aligned[lower_mask]
+    if len(candidates_full) < 100:
+        if return_mask:
+            return float(np.median(z)), 0.0, np.zeros(len(vertices_aligned), dtype=bool)
         return float(np.median(z)), 0.0
 
     rng = np.random.default_rng(rng_seed)
-    if len(candidates) > 20_000:
-        candidates = candidates[rng.choice(len(candidates), 20_000, replace=False)]
+    if len(candidates_full) > 20_000:
+        sub_idx = rng.choice(len(candidates_full), 20_000, replace=False)
+        candidates = candidates_full[sub_idx]
+    else:
+        candidates = candidates_full
 
     cos_thresh = float(np.cos(np.deg2rad(max_normal_dev_deg)))
     up = np.array([0.0, 0.0, 1.0])
 
     best_inliers = 0
     best_z = float(np.median(candidates[:, 2]))
+    best_n: np.ndarray | None = None
+    best_d: float = 0.0
     for _ in range(max_iters):
         idx = rng.choice(len(candidates), 3, replace=False)
         p0, p1, p2 = candidates[idx]
@@ -241,8 +255,18 @@ def _ransac_floor_plane(
             best_inliers = n_in
             inlier_pts = candidates[dists < inlier_thresh]
             best_z = float(np.median(inlier_pts[:, 2]))
+            best_n = n
+            best_d = d
 
-    return best_z, best_inliers / len(candidates)
+    inlier_frac = best_inliers / len(candidates)
+    if not return_mask:
+        return best_z, inlier_frac
+
+    full_mask = np.zeros(len(vertices_aligned), dtype=bool)
+    if best_n is not None:
+        all_dists = np.abs(vertices_aligned @ best_n + best_d)
+        full_mask = lower_mask & (all_dists < inlier_thresh)
+    return best_z, inlier_frac, full_mask
 
 
 def align_scene_from_mesh(
