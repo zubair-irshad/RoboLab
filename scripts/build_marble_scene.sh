@@ -5,10 +5,12 @@
 # End-to-end pipeline for a single Marble / Echo2 Gaussian-splat PLY
 # (no COLMAP, no images, no fast-pgsr — just the .ply):
 #
-#   1. prepare_marble_scene.py    → mesh_aligned.ply + metadata.json
-#   2. dl3dv_mesh_to_usd.py       → mesh_aligned.usd (depth collider)
-#   3. dl3dv_gs_to_usdz.py        → gaussians.usdz   (rgb visual via 3DGUT)
-#   4. sample_dl3dv_placements.py → placements.json + viz_placements.png
+#   1. prepare_marble_scene.py        → mesh_aligned.ply + metadata.json
+#                                        + source.ply (3DGUT-normalized) + source.ply.original
+#   2. visualize_dl3dv_alignment.py   → viz_topdown.png + viz_side.png
+#   3. dl3dv_mesh_to_usd.py           → mesh_aligned.usd (depth collider)
+#   4. dl3dv_gs_to_usdz.py            → gaussians.usdz   (rgb visual via 3DGUT)
+#   5. sample_dl3dv_placements.py     → placements.json + viz_placements.png
 #
 # After this lands, render with:
 #
@@ -25,7 +27,8 @@
 #   UP_AXIS=+z CEILING_M=2.4 bash scripts/build_marble_scene.sh foo.ply out/foo
 #
 # Env-var overrides (with defaults):
-#   UP_AXIS          (+y)                   PLY's up axis (Marble = +y, COLMAP-y-up = -y)
+#   UP_AXIS          (auto)                 PLY's up axis. 'auto' scans all 6 candidates via RANSAC; or +x/-x/+y/-y/+z/-z to override.
+#   GS_SH_MODE       (pad-to-3)             3DGUT requires SH degree 0 or 3. pad-to-3 keeps source's degree-1/2 colour bands; drop = DC only; preserve = passthrough (only valid when source already has 0 or 45 f_rest_*).
 #   METRIC_SCALE     (unset → ceiling)      explicit PLY-units → metres scalar
 #   CEILING_M        (2.7)                  ceiling-height heuristic target (only when METRIC_SCALE unset)
 #   PROXY_METHOD     (poisson)              poisson | alpha | voxel-points
@@ -41,6 +44,7 @@
 #   THREEDGRUT_REPO  (third_party/3dgrut)   local clone of nv-tlabs/3dgrut
 #   THREEDGRUT_ENV   ("")                   conda env for 3DGUT (empty = current env)
 #   SKIP_PREP        (0)                    set 1 to skip prepare_marble_scene
+#   SKIP_VIZ         (0)                    set 1 to skip viz_topdown / viz_side PNGs
 #   SKIP_MESH_USD    (0)                    set 1 to skip mesh_aligned.usd
 #   SKIP_GS_USDZ     (0)                    set 1 to skip 3DGUT (gaussians.usdz)
 #   SKIP_PLACEMENTS  (0)                    set 1 to skip placement sampling
@@ -57,7 +61,8 @@ fi
 DEFAULT_OUT="data/marble_backgrounds/scenes/$(basename "${PLY%.ply}")"
 OUT="${2:-$DEFAULT_OUT}"
 
-UP_AXIS="${UP_AXIS:-+y}"
+UP_AXIS="${UP_AXIS:-auto}"
+GS_SH_MODE="${GS_SH_MODE:-pad-to-3}"
 METRIC_SCALE="${METRIC_SCALE:-}"
 CEILING_M="${CEILING_M:-2.7}"
 PROXY_METHOD="${PROXY_METHOD:-poisson}"
@@ -73,6 +78,7 @@ FLOOR_CLOSE_M="${FLOOR_CLOSE_M:-0.5}"
 THREEDGRUT_REPO="${THREEDGRUT_REPO:-third_party/3dgrut}"
 THREEDGRUT_ENV="${THREEDGRUT_ENV:-}"
 SKIP_PREP="${SKIP_PREP:-0}"
+SKIP_VIZ="${SKIP_VIZ:-0}"
 SKIP_MESH_USD="${SKIP_MESH_USD:-0}"
 SKIP_GS_USDZ="${SKIP_GS_USDZ:-0}"
 SKIP_PLACEMENTS="${SKIP_PLACEMENTS:-0}"
@@ -99,11 +105,12 @@ if [[ "$SKIP_PREP" == "1" ]]; then
     echo "[1/4] === SKIP_PREP=1; not running prepare_marble_scene ==="
 else
     echo
-    echo "[1/4] === prepare_marble_scene (PLY -> aligned mesh + metadata) ==="
+    echo "[1/5] === prepare_marble_scene (PLY -> aligned mesh + metadata) ==="
     PREP_FLAGS=(
         --ply "$PLY"
         --out-dir "$OUT"
         --up-axis "$UP_AXIS"
+        --gs-sh-mode "$GS_SH_MODE"
         --opacity-threshold "$OPACITY_THRESH"
         --proxy-method "$PROXY_METHOD"
         --voxel-size-m "$VOXEL_M"
@@ -118,37 +125,49 @@ else
     python scripts/prepare_marble_scene.py "${PREP_FLAGS[@]}"
 fi
 
-# ------ 2: aligned mesh -> USD collider ------------------------------------
-if [[ "$SKIP_MESH_USD" == "1" ]]; then
+# ------ 2: alignment viz (top-down + side PNGs) ----------------------------
+if [[ "$SKIP_VIZ" == "1" ]]; then
     echo
-    echo "[2/4] === SKIP_MESH_USD=1; not authoring mesh_aligned.usd ==="
+    echo "[2/5] === SKIP_VIZ=1; not rendering alignment viz ==="
 else
     echo
-    echo "[2/4] === mesh_aligned.ply -> mesh_aligned.usd ==="
+    echo "[2/5] === alignment viz (viz_topdown.png + viz_side.png) ==="
+    python scripts/visualize_dl3dv_alignment.py --scene-dir "$OUT"
+fi
+
+# ------ 3: aligned mesh -> USD collider ------------------------------------
+if [[ "$SKIP_MESH_USD" == "1" ]]; then
+    echo
+    echo "[3/5] === SKIP_MESH_USD=1; not authoring mesh_aligned.usd ==="
+else
+    echo
+    echo "[3/5] === mesh_aligned.ply -> mesh_aligned.usd ==="
     python scripts/dl3dv_mesh_to_usd.py --scene-dir "$OUT"
 fi
 
-# ------ 3: source PLY -> gaussians.usdz (3DGUT) ----------------------------
+# ------ 4: source PLY -> gaussians.usdz (3DGUT) ----------------------------
 if [[ "$SKIP_GS_USDZ" == "1" ]]; then
     echo
-    echo "[3/4] === SKIP_GS_USDZ=1; not running 3DGUT ==="
+    echo "[4/5] === SKIP_GS_USDZ=1; not running 3DGUT ==="
 else
     echo
-    echo "[3/4] === source.ply -> gaussians.usdz (3DGUT) ==="
+    echo "[4/5] === source.ply -> gaussians.usdz (3DGUT) ==="
+    # Pass the *normalized* PLY (degree-3 SH) — the original may have a
+    # non-canonical f_rest_* count that 3DGUT rejects.
     python scripts/dl3dv_gs_to_usdz.py \
         --scene-dir "$OUT" \
         --threedgrut-repo "$THREEDGRUT_REPO" \
         --conda-env "$THREEDGRUT_ENV" \
-        --ply "$PLY"
+        --ply "$OUT/source.ply"
 fi
 
-# ------ 4: placement sampling ----------------------------------------------
+# ------ 5: placement sampling ----------------------------------------------
 if [[ "$SKIP_PLACEMENTS" == "1" ]]; then
     echo
-    echo "[4/4] === SKIP_PLACEMENTS=1; not sampling placements ==="
+    echo "[5/5] === SKIP_PLACEMENTS=1; not sampling placements ==="
 else
     echo
-    echo "[4/4] === sample placements ==="
+    echo "[5/5] === sample placements ==="
     # No COLMAP cameras → disable camera-aware floor evidence and the
     # camera-distance filter. The placement script tolerates this and
     # falls back to RANSAC-only floor coverage.

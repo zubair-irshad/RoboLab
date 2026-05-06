@@ -80,7 +80,9 @@ def _render_projection(
     ax.set_xlabel(labels[axes[0]])
     ax.set_ylabel(labels[axes[1]])
     ax.set_title(title)
-    ax.legend(loc="upper right")
+    handles, _ = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(loc="upper right")
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
@@ -100,9 +102,10 @@ def main() -> int:
         )
 
     metadata = json.loads(meta_path.read_text())
-    print(f"[viz] scene_hash = {metadata['scene_hash']}")
-    print(f"[viz] scale     = {metadata['scale']:.4f}")
-    print(f"[viz] median camera height = {metadata['median_camera_height_m']:.2f} m")
+    scene_id = metadata.get("scene_hash") or metadata.get("source_ply") or "<unknown>"
+    print(f"[viz] scene = {scene_id}")
+    print(f"[viz] scale = {metadata['scale']:.4f}")
+    print(f"[viz] median camera height = {metadata.get('median_camera_height_m', 0.0):.2f} m")
     print(f"[viz] floor quality = {metadata['floor_quality_score']:.2f}")
 
     verts = _load_mesh_vertices(mesh_path)
@@ -113,23 +116,30 @@ def main() -> int:
     floor_band_thickness = float(np.std(verts[verts[:, 2] < 0.05][:, 2])) if (verts[:, 2] < 0.05).any() else float("nan")
     print(f"[viz] floor band (z<0.05m) std = {floor_band_thickness:.4f} m")
 
-    # Re-derive camera centers in the aligned frame for the overlay.
-    colmap_src = Path(metadata["colmap_source_path"])
-    R_wc, t_wc = _read_images_metadata(colmap_src)
-    T = np.asarray(metadata["world_from_colmap_4x4"])
-    cam_centers = (T[:3, :3] @ t_wc.T).T + T[:3, 3]
-    print(f"[viz] camera z range = [{cam_centers[:, 2].min():.2f}, {cam_centers[:, 2].max():.2f}] m")
+    # Re-derive camera centers in the aligned frame for the overlay (only
+    # when the metadata actually carries COLMAP cameras — marble / echo2
+    # scenes have no cameras and metadata.colmap_source_path is null).
+    colmap_src_raw = metadata.get("colmap_source_path")
+    cam_centers: np.ndarray | None = None
+    if colmap_src_raw and Path(colmap_src_raw).exists():
+        colmap_src = Path(colmap_src_raw)
+        R_wc, t_wc = _read_images_metadata(colmap_src)
+        T = np.asarray(metadata["world_from_colmap_4x4"])
+        cam_centers = (T[:3, :3] @ t_wc.T).T + T[:3, 3]
+        print(f"[viz] camera z range = [{cam_centers[:, 2].min():.2f}, {cam_centers[:, 2].max():.2f}] m")
+    else:
+        print("[viz] no colmap cameras in metadata — skipping camera overlay")
 
     out_top = scene_dir / "viz_topdown.png"
     out_side = scene_dir / "viz_side.png"
     _render_projection(
         verts, (0, 1), out_top,
-        cameras_xy=cam_centers[:, [0, 1]],
+        cameras_xy=cam_centers[:, [0, 1]] if cam_centers is not None else None,
         title="top-down (x, y) — aligned frame",
     )
     _render_projection(
         verts, (0, 2), out_side,
-        cameras_xy=cam_centers[:, [0, 2]],
+        cameras_xy=cam_centers[:, [0, 2]] if cam_centers is not None else None,
         title="side (x, z) — aligned frame, gravity = -z",
         floor_z=0.0,
     )

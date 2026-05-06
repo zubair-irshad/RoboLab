@@ -88,10 +88,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", type=Path, required=True,
                    help="scene directory to populate (created if missing)")
     p.add_argument(
-        "--up-axis", choices=tuple(_UP_AXES), default="+y",
-        help="which axis of the input PLY points up. Marble / Three.js / "
-             "OpenGL convention is +y; many photogrammetry exports are +z. "
-             "Refined automatically by RANSAC after the initial guess.",
+        "--up-axis", choices=("auto",) + tuple(_UP_AXES), default="auto",
+        help="which axis of the input PLY points up. ``auto`` (default) "
+             "scans all 6 candidates and picks the one whose lower-third "
+             "RANSAC floor wins on inlier fraction — works regardless of "
+             "the generator's convention. Pass +y for Marble / Three.js, "
+             "+z for COLMAP-z-up, etc. when you want to override.",
     )
     p.add_argument(
         "--metric-scale", type=float, default=None,
@@ -156,8 +158,21 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--symlink-source", action="store_true",
-        help="symlink the input PLY to <out-dir>/source.ply (default copies). "
-             "Symlinks save disk but break if the source moves.",
+        help="symlink the input PLY to <out-dir>/source.ply.original instead "
+             "of copying it. Symlinks save disk but break if the source moves.",
+    )
+    p.add_argument(
+        "--gs-sh-mode",
+        choices=("pad-to-3", "drop", "preserve"),
+        default="pad-to-3",
+        help="how to normalize SH coefficients when writing source.ply "
+             "(consumed by 3DGUT, which only accepts SH degree 0 or 3). "
+             "pad-to-3 (default): keep DC + existing degree-1/2 bands, "
+             "zero-pad up to degree 3 — preserves view-dependent colour "
+             "from the source. drop: keep DC only, set f_rest=zeros — "
+             "safe but loses any view-dependent shading. preserve: copy "
+             "f_rest as-is — only valid when source already has 0 or 45 "
+             "f_rest_* properties.",
     )
     return p.parse_args()
 
@@ -234,6 +249,63 @@ def _read_ply_points(
 
     print(f"[prepare-marble] loaded {len(xyz):,} points from {ply_path.name}")
     return xyz, colors
+
+
+# ---- up-axis auto-detection -------------------------------------------------
+
+def auto_detect_up_axis(
+    points: np.ndarray, *,
+    floor_inlier_thresh_frac: float = 0.01,
+    rng_seed: int = 0,
+) -> tuple[str, dict[str, float]]:
+    """Pick the axis whose lower-third RANSAC floor has the most inliers.
+
+    For each of the 6 candidate world-up directions (±x, ±y, ±z):
+      1. Rotate the cloud so the candidate becomes +Z.
+      2. Run RANSAC on the lower 30% of z (per the existing helper).
+      3. Score = inlier fraction.
+
+    The candidate with the highest score wins. Tie-breaker prefers the
+    candidate whose median z (above floor) is positive — i.e. the cloud
+    actually extends *upward* away from the floor, not downward (which
+    would mean we picked the ceiling as the floor).
+
+    The RANSAC threshold is auto-scaled by the cloud's vertical extent
+    so this works in arbitrary unscaled units.
+    """
+    extent = float(np.percentile(points, 95, axis=0).max() -
+                   np.percentile(points, 5, axis=0).min())
+    thresh = max(extent * floor_inlier_thresh_frac, 1e-6)
+
+    scores: dict[str, float] = {}
+    margins: dict[str, float] = {}
+    for axis_name, world_up in _UP_AXES.items():
+        R = _R_align_up_to_z(world_up)
+        rotated = points @ R.T
+        floor_z, inlier_frac = _ransac_floor_plane(
+            rotated, inlier_thresh=thresh, rng_seed=rng_seed,
+        )
+        # Margin: 95th percentile of z above the fitted floor. Positive
+        # means the cloud genuinely extends upward; negative means we
+        # locked onto the ceiling and "above" is actually downward.
+        z_above = float(np.percentile(rotated[:, 2], 95) - floor_z)
+        scores[axis_name] = inlier_frac
+        margins[axis_name] = z_above
+
+    # Penalize candidates with non-positive upward margin so we don't
+    # accidentally pick the ceiling.
+    ranked = sorted(
+        scores.items(),
+        key=lambda kv: (kv[1] if margins[kv[0]] > 0 else kv[1] - 1.0),
+        reverse=True,
+    )
+    best = ranked[0][0]
+    print("[auto-up] candidates (axis: inlier_frac, upward_margin):")
+    for axis_name, frac in ranked:
+        print(f"           {axis_name:>2s}: inliers={frac:.3f}, "
+              f"upward_margin={margins[axis_name]:+.3f} (units)")
+    print(f"[auto-up] selected: {best}")
+    return best, scores
 
 
 # ---- alignment (no-COLMAP variant) -----------------------------------------
@@ -471,6 +543,164 @@ def write_proxy_ply(proxy: ProxyMesh, out_path: Path) -> None:
     mesh.export(str(out_path))
 
 
+# ---- 3DGUT-compatible PLY normalizer ---------------------------------------
+#
+# 3DGUT's loader (threedgrut.model.model.GaussianModel.init_from_ply) only
+# accepts SH layouts where the f_rest_* count is exactly 0 (degree 0) or
+# exactly 45 (degree 3). Many generators (Marble, some Echo2 variants)
+# emit degree-1 PLYs with 9 f_rest_* properties — those are rejected with
+# a 'found 9, expected 45 or 0' ValueError.
+#
+# We rewrite the PLY to a 3DGUT-acceptable layout. The vertex layout
+# (positions, normals, opacity, scales, rotations, colours) is preserved
+# byte-for-byte; only the f_rest_* properties are rewritten according to
+# --gs-sh-mode.
+
+def _channel_major_pad(src: np.ndarray, src_deg: int, dst_deg: int) -> np.ndarray:
+    """Pad an (N, K_src*3) f_rest array to (N, K_dst*3), zero-fill new bands.
+
+    INRIA's 3DGS PLY layout for f_rest_* is channel-major,
+    coefficient-minor:
+
+        for c in 0..2:
+            for k in 0..(K-1):
+                f_rest_{c*K + k}
+
+    where K = (deg+1)^2 - 1 = 3, 8, or 15 for degrees 1, 2, 3. Padding to
+    a higher degree means inserting (K_dst - K_src) zeros after each
+    channel's existing block.
+    """
+    k_src = (src_deg + 1) ** 2 - 1
+    k_dst = (dst_deg + 1) ** 2 - 1
+    assert src.shape[1] == k_src * 3, src.shape
+    n = src.shape[0]
+    out = np.zeros((n, k_dst * 3), dtype=src.dtype)
+    src_per_ch = src.reshape(n, 3, k_src)  # (N, channels, coeffs)
+    out_per_ch = out.reshape(n, 3, k_dst)
+    out_per_ch[:, :, :k_src] = src_per_ch
+    return out_per_ch.reshape(n, k_dst * 3)
+
+
+def _f_rest_count_to_degree(n_f_rest: int) -> int | None:
+    """Map an f_rest_* count to the SH degree it represents (or None)."""
+    # n_f_rest = 3 * ((deg+1)^2 - 1)
+    for deg in (0, 1, 2, 3):
+        if 3 * ((deg + 1) ** 2 - 1) == n_f_rest:
+            return deg
+    return None
+
+
+def normalize_gs_ply_for_3dgut(
+    src_ply: Path, dst_ply: Path, *, mode: str = "pad-to-3",
+) -> dict:
+    """Rewrite ``src_ply`` to ``dst_ply`` with a 3DGUT-compatible SH layout.
+
+    Modes:
+      * ``pad-to-3`` (default) — pad existing f_rest_* up to 45 with
+        zeros (preserves source's degree-1/2 colour bands).
+      * ``drop`` — drop f_rest_* entirely (degree 0; DC colour only).
+      * ``preserve`` — copy as-is; raises if not already 0 or 45.
+
+    Returns a small dict describing what changed (for metadata).
+    """
+    try:
+        from plyfile import PlyData, PlyElement
+    except ImportError as e:
+        raise ImportError(
+            "plyfile required for 3DGUT PLY normalization; `pip install plyfile`"
+        ) from e
+
+    pd = PlyData.read(str(src_ply))
+    if "vertex" not in [el.name for el in pd.elements]:
+        raise ValueError(f"PLY {src_ply} has no 'vertex' element")
+    v = pd["vertex"]
+    names = list(v.data.dtype.names)
+    f_rest_names = [n for n in names if n.startswith("f_rest_")]
+    n_src = len(f_rest_names)
+    src_deg = _f_rest_count_to_degree(n_src)
+
+    print(f"[normalize] source has {n_src} f_rest_* properties "
+          f"(degree {src_deg if src_deg is not None else '??'})")
+
+    # Decide target degree.
+    if mode == "preserve":
+        if n_src not in (0, 45):
+            raise ValueError(
+                f"source has {n_src} f_rest_* properties; "
+                f"--gs-sh-mode preserve only accepts 0 or 45. "
+                f"Use pad-to-3 or drop instead."
+            )
+        if src_ply.resolve() == dst_ply.resolve():
+            return {"mode": "preserve", "src_degree": src_deg, "dst_degree": src_deg, "rewrote": False}
+        # Even in "preserve" mode we still copy (so callers can rely on
+        # dst_ply existing).
+        import shutil
+        shutil.copy2(src_ply, dst_ply)
+        return {"mode": "preserve", "src_degree": src_deg, "dst_degree": src_deg, "rewrote": True}
+
+    if mode == "drop":
+        dst_deg = 0
+    elif mode == "pad-to-3":
+        if src_deg is None:
+            raise ValueError(
+                f"source has {n_src} f_rest_* properties — not a recognized "
+                f"SH degree count. Try --gs-sh-mode drop."
+            )
+        dst_deg = 3
+    else:
+        raise ValueError(f"unknown --gs-sh-mode {mode!r}")
+
+    n_dst = 3 * ((dst_deg + 1) ** 2 - 1)
+
+    # Carry over every non-f_rest property unchanged.
+    keep_names = [n for n in names if not n.startswith("f_rest_")]
+
+    # Build the new dtype.
+    dtype_lookup = dict(v.data.dtype.descr)  # name -> dtype string
+    new_dtype = [(n, dtype_lookup[n]) for n in keep_names]
+    f_rest_dtype = "<f4"  # standard 3DGS PLYs use float32 for SH
+    if n_src > 0:
+        f_rest_dtype = dtype_lookup[f_rest_names[0]]
+    new_dtype += [(f"f_rest_{i}", f_rest_dtype) for i in range(n_dst)]
+
+    n_verts = len(v.data)
+    new_arr = np.empty(n_verts, dtype=new_dtype)
+    for n in keep_names:
+        new_arr[n] = v[n]
+
+    if n_dst > 0:
+        if n_src == 0:
+            # Source has no SH beyond DC. Pad with zeros.
+            for i in range(n_dst):
+                new_arr[f"f_rest_{i}"] = 0.0
+        else:
+            src_block = np.stack([np.asarray(v[n]) for n in f_rest_names], axis=1)
+            padded = _channel_major_pad(
+                src_block, src_deg=src_deg, dst_deg=dst_deg,
+            ).astype(np.dtype(f_rest_dtype))
+            for i in range(n_dst):
+                new_arr[f"f_rest_{i}"] = padded[:, i]
+
+    # Reassemble. Preserve other elements (e.g. 'face', though splat PLYs
+    # rarely have faces) and the source endianness/format choice.
+    new_vertex_el = PlyElement.describe(new_arr, "vertex")
+    other_els = [el for el in pd.elements if el.name != "vertex"]
+    out_pd = PlyData([new_vertex_el, *other_els], text=pd.text, byte_order=pd.byte_order)
+    dst_ply.parent.mkdir(parents=True, exist_ok=True)
+    out_pd.write(str(dst_ply))
+
+    print(f"[normalize] rewrote SH degree {src_deg} -> {dst_deg} "
+          f"({n_src} -> {n_dst} f_rest_* properties); wrote {dst_ply}")
+    return {
+        "mode": mode,
+        "src_degree": src_deg,
+        "dst_degree": dst_deg,
+        "src_f_rest_count": n_src,
+        "dst_f_rest_count": n_dst,
+        "rewrote": True,
+    }
+
+
 # ---- main ------------------------------------------------------------------
 
 def main() -> int:
@@ -506,9 +736,17 @@ def main() -> int:
             colors = colors[idx]
         print(f"[prepare-marble] subsampled to {len(points):,} points")
 
+    # Up-axis: either explicit (+x, -x, ..., +z, -z) or 'auto' which scans
+    # all 6 candidates and picks the best RANSAC floor.
+    auto_up_scores: dict[str, float] | None = None
+    if args.up_axis == "auto":
+        chosen_axis, auto_up_scores = auto_detect_up_axis(points)
+    else:
+        chosen_axis = args.up_axis
+
     aligned = align_pointcloud(
         points=points,
-        initial_world_up=_UP_AXES[args.up_axis],
+        initial_world_up=_UP_AXES[chosen_axis],
         metric_scale=args.metric_scale,
         target_ceiling_height_m=args.ceiling_height_m,
         refine_gravity=(args.max_gravity_correction_deg > 0),
@@ -549,22 +787,32 @@ def main() -> int:
     write_proxy_ply(proxy, aligned_mesh_path)
     print(f"[prepare-marble] wrote {aligned_mesh_path}")
 
-    # Symlink (or copy) the original PLY so 3DGUT can find it next to
-    # the metadata. The render script reads `--gs-usdz`, not the PLY,
-    # but having `source.ply` in the scene dir makes the pipeline
-    # self-describing.
-    src_link = out_dir / "source.ply"
-    if src_link.exists() or src_link.is_symlink():
-        src_link.unlink()
+    # Write a 3DGUT-compatible source.ply to the scene dir. 3DGUT's PLY
+    # loader only accepts SH degree 0 (no f_rest_*) or 3 (45 f_rest_*).
+    # Marble PLYs commonly carry degree 1 (9 f_rest_*) which 3DGUT
+    # rejects with 'found 9, expected 45 or 0'. We normalize here so
+    # the downstream `dl3dv_gs_to_usdz.py --ply <out_dir>/source.ply`
+    # call always succeeds.
+    #
+    # Also keep a `source.ply.original` symlink/copy so the unmodified
+    # source is available next to the normalized one.
+    src_normalized = out_dir / "source.ply"
+    src_original = out_dir / "source.ply.original"
+    if src_original.exists() or src_original.is_symlink():
+        src_original.unlink()
     if args.symlink_source:
         try:
-            src_link.symlink_to(ply_path)
+            src_original.symlink_to(ply_path)
         except OSError:
             import shutil
-            shutil.copy2(ply_path, src_link)
+            shutil.copy2(ply_path, src_original)
     else:
         import shutil
-        shutil.copy2(ply_path, src_link)
+        shutil.copy2(ply_path, src_original)
+
+    sh_info = normalize_gs_ply_for_3dgut(
+        ply_path, src_normalized, mode=args.gs_sh_mode,
+    )
 
     metadata = {
         # NB: keys named *_colmap_* are kept for compatibility with the
@@ -572,7 +820,8 @@ def main() -> int:
         # "raw input frame" here, not literal COLMAP.
         "scene_hash": ply_path.stem,
         "source_ply": str(ply_path),
-        "source_ply_local": str(src_link),
+        "source_ply_original": str(src_original),
+        "source_ply_normalized": str(src_normalized),
         "source_format": "marble_gs_ply",
         "colmap_source_path": None,  # signal: no COLMAP cameras
         "aligned_mesh_path": str(aligned_mesh_path),
@@ -586,7 +835,10 @@ def main() -> int:
         "metric_scale_hint": args.metric_scale,
         "ceiling_height_target_m": args.ceiling_height_m,
         "scale_source": "user" if args.metric_scale is not None else "ceiling_height_heuristic",
-        "initial_up_axis": args.up_axis,
+        "up_axis_requested": args.up_axis,
+        "up_axis_chosen": chosen_axis,
+        "auto_up_scores": auto_up_scores,
+        "gs_sh_normalization": sh_info,
         "proxy_mesh": {
             "method": args.proxy_method,
             "voxel_size_m": args.voxel_size_m,
@@ -603,7 +855,7 @@ def main() -> int:
     print("\n[prepare-marble] next steps:")
     print(f"    python scripts/dl3dv_mesh_to_usd.py --scene-dir {out_dir}")
     print(f"    python scripts/dl3dv_gs_to_usdz.py  --scene-dir {out_dir} "
-          f"--ply {ply_path}")
+          f"--ply {src_normalized}")
     print(f"    python scripts/sample_dl3dv_placements.py "
           f"--scene-dir {out_dir} --camera-floor-radius 0")
     return 0

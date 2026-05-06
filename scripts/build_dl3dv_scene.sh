@@ -83,33 +83,39 @@ echo
 echo "[1/5] === download + train + mesh + align ==="
 python scripts/prepare_dl3dv_scene.py "${PREP_FLAGS[@]}"
 
-# ------ 4: mesh_aligned.ply -> mesh_aligned.usd ------
+# ------ 4: alignment viz (top-down + side PNGs) ------
 echo
-echo "[2/5] === mesh_aligned.ply -> mesh_aligned.usd ==="
+echo "[2/6] === alignment viz (viz_topdown.png + viz_side.png) ==="
+python scripts/visualize_dl3dv_alignment.py --scene-dir "$SCENE_DIR" || \
+    echo "[build] viz step failed (non-fatal); continuing"
+
+# ------ 5: mesh_aligned.ply -> mesh_aligned.usd ------
+echo
+echo "[3/6] === mesh_aligned.ply -> mesh_aligned.usd ==="
 python scripts/dl3dv_mesh_to_usd.py --scene-dir "$SCENE_DIR"
 
-# ------ 5: point_cloud.ply -> gaussians.usdz (3DGUT) ------
+# ------ 6: point_cloud.ply -> gaussians.usdz (3DGUT) ------
 if [[ "$SKIP_GS_USDZ" == "1" ]]; then
     echo
-    echo "[3/5] === SKIP_GS_USDZ=1; not running 3DGUT ==="
+    echo "[4/6] === SKIP_GS_USDZ=1; not running 3DGUT ==="
 else
     echo
-    echo "[3/5] === point_cloud.ply -> gaussians.usdz (3DGUT) ==="
+    echo "[4/6] === point_cloud.ply -> gaussians.usdz (3DGUT) ==="
     python scripts/dl3dv_gs_to_usdz.py \
         --scene-dir "$SCENE_DIR" \
         --threedgrut-repo "$THREEDGRUT_REPO"
 fi
 
-# ------ 6: sample placements ------
+# ------ 7: sample placements ------
 echo
-echo "[4/5] === sample placements (camera-aware) ==="
+echo "[5/6] === sample placements (camera-aware) ==="
 python scripts/sample_dl3dv_placements.py \
     --scene-dir "$SCENE_DIR" \
     --n "$N_PLACEMENTS" \
     --max-distance-to-camera "$MAX_CAM_DIST_M"
 
 echo
-echo "[5/5] === DONE ==="
+echo "[6/6] === DONE ==="
 echo "Scene artifacts under: $SCENE_DIR"
 ls -lh "$SCENE_DIR"/*.{ply,usd,usdz,json,png} 2>/dev/null || true
 
