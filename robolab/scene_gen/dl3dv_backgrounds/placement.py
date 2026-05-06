@@ -256,6 +256,7 @@ def sample_placements(
     min_separation_m: float = 0.5,
     camera_centers_world: np.ndarray | None = None,
     max_camera_distance_m: float | None = None,
+    camera_floor_radius_m: float = 1.5,
 ) -> list[Placement]:
     """Sample ``n_placements`` valid foreground poses on the aligned floor.
 
@@ -281,11 +282,34 @@ def sample_placements(
         table_height_m=footprint.table_height_m,
     )
 
-    # Close the floor mask first to bridge gaps caused by furniture
-    # occluding floor capture. Doesn't extend the floor outside its
-    # original convex hull.
+    # Close the floor mask to bridge gaps caused by furniture occluding
+    # floor capture (closing doesn't extend floor outside its convex hull).
     close_cells = int(np.ceil(floor_close_radius_m / cell_size_m))
     has_floor_closed = _close(has_floor, close_cells)
+
+    # Camera-position floor evidence: anywhere the operator walked, the
+    # floor was directly underneath them — even if the camera was
+    # pointed at a sofa rather than the floor. Project camera xy to the
+    # grid, dilate by ``camera_floor_radius_m``, and union with the
+    # RANSAC-derived floor. This fixes the common pattern where a
+    # camera-dense area has SPARSE RANSAC coverage because the operator
+    # was looking at furniture there.
+    if camera_centers_world is not None and camera_floor_radius_m > 0:
+        cam_xy = np.asarray(camera_centers_world)[:, :2]
+        cam_floor = np.zeros_like(has_floor)
+        ix_cam = np.clip(((cam_xy[:, 0] - xmin) / cell_size_m).astype(int), 0, has_floor.shape[1] - 1)
+        iy_cam = np.clip(((cam_xy[:, 1] - ymin) / cell_size_m).astype(int), 0, has_floor.shape[0] - 1)
+        cam_floor[iy_cam, ix_cam] = True
+        cam_dilate_cells = int(np.ceil(camera_floor_radius_m / cell_size_m))
+        # _erode dilates True regions when applied to a binary mask.
+        cam_floor = _erode(cam_floor, cam_dilate_cells)
+        n_added = int((cam_floor & ~has_floor_closed).sum())
+        has_floor_closed = has_floor_closed | cam_floor
+        print(
+            f"[placement] camera-position floor evidence: dilated {len(cam_xy)} "
+            f"cameras by {camera_floor_radius_m} m, added {n_added} cells "
+            f"to the floor mask"
+        )
 
     # Three independent erosions, AND'd together:
     #   - low obstacles dilate by half_diag (table-only clearance)

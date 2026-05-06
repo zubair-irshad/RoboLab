@@ -149,13 +149,18 @@ def main() -> int:
                         "must clear footprint only; above = must clear "
                         "footprint + reach. Lets the arm sweep over sofas "
                         "while still avoiding walls.")
-    p.add_argument("--floor-close-radius", type=float, default=0.5,
+    p.add_argument("--floor-close-radius", type=float, default=1.0,
                    help="morphological closing radius (m) applied to the "
-                        "RANSAC floor mask. RANSAC only labels pixels with "
-                        "triangulated floor evidence; furniture occludes "
-                        "large gaps in this. Closing fills holes up to this "
-                        "radius, restoring the floor under sofas etc. "
-                        "Default 0.5 m.")
+                        "RANSAC floor mask. Bridges gaps where furniture "
+                        "occludes floor capture. Default 1.0 m.")
+    p.add_argument(
+        "--camera-floor-radius", type=float, default=1.5,
+        help="every training camera position contributes a disk of this "
+             "radius (m) to the floor mask, on the assumption that the "
+             "operator was walking on the floor. Fills in patchy regions "
+             "where cameras were dense but RANSAC inliers were sparse. "
+             "Pass 0 to disable.",
+    )
     p.add_argument("--yaw", choices=("face_centroid", "random"),
                    default="face_centroid")
     p.add_argument("--sampling", choices=("farthest_point", "random"),
@@ -191,10 +196,12 @@ def main() -> int:
         robot_reach_m=args.robot_reach,
         table_height_m=args.table_height,
     )
-    # If we'll filter by camera distance, derive camera centres in aligned
-    # world frame up front (same math the rerun viz uses).
+    # Derive camera centres in aligned world frame. We need them whenever
+    # camera-floor-radius > 0 (uses cam positions as floor evidence) OR
+    # max-distance-to-camera is set (filters placements near cameras).
+    needs_cams = args.camera_floor_radius > 0 or args.max_distance_to_camera is not None
     cam_centers_world = None
-    if args.max_distance_to_camera is not None:
+    if needs_cams:
         R_wc, t_wc = _read_images_metadata(Path(metadata["colmap_source_path"]))
         T = np.asarray(metadata["world_from_colmap_4x4"])
         cam_centers_world = (T[:3, :3] @ t_wc.T).T + T[:3, 3]
@@ -211,6 +218,7 @@ def main() -> int:
         min_separation_m=args.min_separation,
         camera_centers_world=cam_centers_world,
         max_camera_distance_m=args.max_distance_to_camera,
+        camera_floor_radius_m=args.camera_floor_radius,
     )
 
     out_json = scene_dir / "placements.json"
