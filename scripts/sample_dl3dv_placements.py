@@ -180,6 +180,14 @@ def main() -> int:
              "far from any camera produces blurry/smeared walls. Try 1.5–2.5 "
              "metres for typical handheld captures.",
     )
+    p.add_argument(
+        "--min-floor-area-m2", type=float, default=3.0,
+        help="drop floor connected-components smaller than this area "
+             "(m²). Removes RANSAC false-positives from adjacent rooms / "
+             "horizontal furniture surfaces / outdoor patches that the "
+             "morphological closing might bridge to the real room. "
+             "Pass 0 to disable. Default 3 m² ≈ smallest plausible room.",
+    )
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -229,6 +237,7 @@ def main() -> int:
         camera_centers_world=cam_centers_world,
         max_camera_distance_m=args.max_distance_to_camera,
         camera_floor_radius_m=args.camera_floor_radius,
+        min_floor_area_m2=args.min_floor_area_m2,
     )
 
     out_json = scene_dir / "placements.json"

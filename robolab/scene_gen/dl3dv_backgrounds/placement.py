@@ -198,6 +198,57 @@ def _erode(occupancy: np.ndarray, radius_cells: int) -> np.ndarray:
         return windowed.any(axis=(-1, -2))
 
 
+def _keep_components_above_area(
+    mask: np.ndarray, min_cells: int,
+) -> tuple[np.ndarray, list[int]]:
+    """Drop connected components in ``mask`` smaller than ``min_cells``.
+
+    Returns ``(filtered_mask, kept_areas)`` where ``kept_areas`` is a
+    sorted-descending list of the surviving component areas (in cells).
+
+    4-connectivity. Uses scipy when available, falls back to an
+    iterative numpy flood fill.
+    """
+    if min_cells <= 1 or not mask.any():
+        return mask.copy(), [int(mask.sum())] if mask.any() else []
+    try:
+        from scipy.ndimage import label  # type: ignore[import-not-found]
+        labels, n_components = label(mask)
+    except ImportError:
+        labels = np.zeros_like(mask, dtype=np.int32)
+        n_components = 0
+        h, w = mask.shape
+        for sy in range(h):
+            for sx in range(w):
+                if not mask[sy, sx] or labels[sy, sx] != 0:
+                    continue
+                n_components += 1
+                stack = [(sy, sx)]
+                labels[sy, sx] = n_components
+                while stack:
+                    y, x = stack.pop()
+                    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        ny, nx = y + dy, x + dx
+                        if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and labels[ny, nx] == 0:
+                            labels[ny, nx] = n_components
+                            stack.append((ny, nx))
+
+    sizes = np.bincount(labels.ravel())  # sizes[0] = background
+    keep_labels = np.where(sizes >= min_cells)[0]
+    keep_labels = keep_labels[keep_labels != 0]
+    if len(keep_labels) == 0:
+        # Nothing meets the threshold; fall back to keeping the largest
+        # so the caller still has something to work with.
+        if n_components == 0:
+            return np.zeros_like(mask), []
+        largest = int(np.argmax(sizes[1:]) + 1)
+        out = labels == largest
+        return out, [int(sizes[largest])]
+    out = np.isin(labels, keep_labels)
+    kept_areas = sorted((int(sizes[k]) for k in keep_labels), reverse=True)
+    return out, kept_areas
+
+
 def _close(mask: np.ndarray, radius_cells: int) -> np.ndarray:
     """Morphological closing: fill holes / bridge gaps up to ``radius_cells``.
 
@@ -257,6 +308,7 @@ def sample_placements(
     camera_centers_world: np.ndarray | None = None,
     max_camera_distance_m: float | None = None,
     camera_floor_radius_m: float = 1.5,
+    min_floor_area_m2: float = 3.0,
 ) -> list[Placement]:
     """Sample ``n_placements`` valid foreground poses on the aligned floor.
 
@@ -286,6 +338,25 @@ def sample_placements(
     # floor capture (closing doesn't extend floor outside its convex hull).
     close_cells = int(np.ceil(floor_close_radius_m / cell_size_m))
     has_floor_closed = _close(has_floor, close_cells)
+
+    # Drop tiny floor components (RANSAC false positives in adjacent
+    # rooms / outside / on furniture). Without this, the closing step
+    # can bridge real-room floor with stray planar regions and produce
+    # placements that land outside the actual room.
+    if min_floor_area_m2 > 0:
+        min_cells = int(np.ceil(min_floor_area_m2 / (cell_size_m ** 2)))
+        n_before = int(has_floor_closed.sum())
+        has_floor_closed, kept_areas = _keep_components_above_area(
+            has_floor_closed, min_cells,
+        )
+        n_after = int(has_floor_closed.sum())
+        kept_m2 = [a * cell_size_m ** 2 for a in kept_areas]
+        print(
+            f"[placement] floor connected-components filter: kept "
+            f"{len(kept_areas)} component(s) ≥ {min_floor_area_m2:.1f} m² "
+            f"(areas = {[round(a, 2) for a in kept_m2]} m²); "
+            f"{n_before - n_after} cells dropped"
+        )
 
     # Camera-position floor evidence: anywhere the operator walked, the
     # floor was directly underneath them — even if the camera was
