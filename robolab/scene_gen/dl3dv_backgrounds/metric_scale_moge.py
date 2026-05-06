@@ -92,6 +92,7 @@ class _ImageRecord:
     t_cw: np.ndarray   # cam-from-world translation
     point2D_xy: np.ndarray  # (N, 2)
     point3D_ids: np.ndarray  # (N,) int64; -1 means "no 3D match"
+    camera_id: int = -1
 
 
 def _read_images_bin(path: Path) -> list[_ImageRecord]:
@@ -102,7 +103,7 @@ def _read_images_bin(path: Path) -> list[_ImageRecord]:
             f.read(4)  # image_id
             qw, qx, qy, qz = struct.unpack("<4d", f.read(32))
             tx, ty, tz = struct.unpack("<3d", f.read(24))
-            f.read(4)  # camera_id
+            (cam_id,) = struct.unpack("<I", f.read(4))
             chars: list[bytes] = []
             while True:
                 ch = f.read(1)
@@ -123,8 +124,66 @@ def _read_images_bin(path: Path) -> list[_ImageRecord]:
                 t_cw=np.array([tx, ty, tz]),
                 point2D_xy=xy,
                 point3D_ids=pids,
+                camera_id=int(cam_id),
             ))
     return recs
+
+
+# ---- camera intrinsics (for FoV → MoGe) -----------------------------------
+
+# Param layout per COLMAP camera model: leading params that are pixel units
+# and the index of fx (so fov_x = 2·atan(W / (2·fx))).
+_COLMAP_FX_INDEX_AND_NPARAMS: dict[str, tuple[int, int]] = {
+    "SIMPLE_PINHOLE": (0, 3),
+    "SIMPLE_RADIAL": (0, 4),
+    "RADIAL": (0, 5),
+    "SIMPLE_RADIAL_FISHEYE": (0, 4),
+    "RADIAL_FISHEYE": (0, 5),
+    "PINHOLE": (0, 4),
+    "OPENCV": (0, 8),
+    "OPENCV_FISHEYE": (0, 8),
+    "FULL_OPENCV": (0, 12),
+    "FOV": (0, 5),
+    "THIN_PRISM_FISHEYE": (0, 12),
+}
+_COLMAP_MODEL_BIN_ID = {
+    0: ("SIMPLE_PINHOLE", 3), 1: ("PINHOLE", 4), 2: ("SIMPLE_RADIAL", 4),
+    3: ("RADIAL", 5), 4: ("OPENCV", 8), 5: ("OPENCV_FISHEYE", 8),
+    6: ("FULL_OPENCV", 12), 7: ("FOV", 5), 8: ("SIMPLE_RADIAL_FISHEYE", 4),
+    9: ("RADIAL_FISHEYE", 5), 10: ("THIN_PRISM_FISHEYE", 12),
+}
+
+
+def _read_cameras(sparse_dir: Path) -> dict[int, dict]:
+    """Return {camera_id: {'model', 'width', 'height', 'fx'}}."""
+    cams: dict[int, dict] = {}
+    binp = sparse_dir / "cameras.bin"
+    txt = sparse_dir / "cameras.txt"
+    if binp.is_file():
+        with binp.open("rb") as f:
+            (n,) = struct.unpack("<Q", f.read(8))
+            for _ in range(n):
+                cid, mid = struct.unpack("<iI", f.read(8))
+                w, h = struct.unpack("<QQ", f.read(16))
+                model_name, npar = _COLMAP_MODEL_BIN_ID[mid]
+                params = list(struct.unpack(f"<{npar}d", f.read(8 * npar)))
+                cams[int(cid)] = dict(model=model_name, width=int(w), height=int(h), fx=float(params[0]))
+        return cams
+    if txt.is_file():
+        for raw in txt.read_text().splitlines():
+            if not raw.strip() or raw.startswith("#"):
+                continue
+            parts = raw.split()
+            cid = int(parts[0]); model_name = parts[1]
+            w = int(parts[2]); h = int(parts[3])
+            cams[cid] = dict(model=model_name, width=w, height=h, fx=float(parts[4]))
+        return cams
+    raise FileNotFoundError(f"no cameras.{{bin,txt}} under {sparse_dir}")
+
+
+def _fov_x_deg(width: int, fx: float) -> float:
+    """Horizontal FoV in degrees from image width and fx."""
+    return float(2.0 * np.arctan(width / (2.0 * fx)) * 180.0 / np.pi)
 
 
 def _read_images_txt(path: Path) -> list[_ImageRecord]:
@@ -135,6 +194,7 @@ def _read_images_txt(path: Path) -> list[_ImageRecord]:
         # IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
         qw, qx, qy, qz = (float(head[k]) for k in range(1, 5))
         tx, ty, tz = (float(head[k]) for k in range(5, 8))
+        cam_id = int(head[8])
         name = head[9]
         body = lines[i + 1].split() if i + 1 < len(lines) else []
         # body: x y point3D_id repeated
@@ -150,6 +210,7 @@ def _read_images_txt(path: Path) -> list[_ImageRecord]:
             t_cw=np.array([tx, ty, tz]),
             point2D_xy=xy,
             point3D_ids=pids,
+            camera_id=cam_id,
         ))
     return recs
 
@@ -177,10 +238,11 @@ class MoGeScaleResult:
 def estimate_metric_scale_via_moge(
     *,
     colmap_source_path: Path,
-    num_frames: int = 5,
+    num_frames: int = 20,
     device: str = "cuda",
     model_name: str = "Ruicheng/moge-2-vitl-normal",
     min_correspondences_per_frame: int = 20,
+    mad_outlier_k: float = 3.0,
     rng_seed: int = 0,
 ) -> MoGeScaleResult:
     """Estimate metric-per-COLMAP scale by comparing MoGe depth to COLMAP depth.
@@ -199,6 +261,7 @@ def estimate_metric_scale_via_moge(
 
     image_recs = _read_images(sparse_dir)
     points3D = _read_points3D(sparse_dir)
+    cameras = _read_cameras(sparse_dir)
 
     # Drop records whose image file isn't on disk (DL3DV variant filtering may
     # leave images.bin entries pointing at unshipped frames).
@@ -243,8 +306,20 @@ def estimate_metric_scale_via_moge(
         H, W = rgb.shape[:2]
 
         img_t = torch.from_numpy(rgb).permute(2, 0, 1).float().div_(255.0).to(device)
+        # Critical: pass FoV from COLMAP intrinsics. MoGe-v2's metric depth
+        # depends on knowing the camera's horizontal FoV; if you skip this
+        # MoGe estimates FoV from the image and per-frame estimates can
+        # disagree by 4×, completely breaking the scale ratio.
+        cam = cameras.get(rec.camera_id)
+        fov_kwargs: dict = {}
+        if cam is not None:
+            # Use the actual loaded image width — DL3DV downsamples to
+            # images_4 etc, and our autorescale rewrites cameras.txt to
+            # match, but be defensive in case it didn't.
+            fov_x = _fov_x_deg(W, cam["fx"] * (W / cam["width"]))
+            fov_kwargs["fov_x"] = fov_x
         with torch.no_grad():
-            output = model.infer(img_t)
+            output = model.infer(img_t, **fov_kwargs)
         depth_metric = output["depth"].detach().cpu().numpy()
         mask = output.get("mask")
         if mask is not None:
@@ -285,16 +360,42 @@ def estimate_metric_scale_via_moge(
             "MoGe mask quality / COLMAP point density"
         )
 
-    final = float(np.median(per_frame_scales))
-    spread = float(np.std(per_frame_scales))
+    # MAD-based outlier rejection: drop frames whose scale is >k MAD
+    # from the median, then recompute median on the kept set. MAD is
+    # used instead of std because it's robust to the very outliers we're
+    # trying to drop.
+    arr = np.array(per_frame_scales)
+    median_raw = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - median_raw))) or 1e-9
+    keep_mask = np.abs(arr - median_raw) <= mad_outlier_k * mad
+    kept = arr[keep_mask].tolist()
+    dropped = arr[~keep_mask].tolist()
+    if dropped:
+        print(
+            f"[moge] MAD outlier rejection: dropped {len(dropped)} frame(s) "
+            f"with scales {[round(s, 4) for s in dropped]} "
+            f"(median={median_raw:.4f}, MAD={mad:.4f}, k={mad_outlier_k})"
+        )
+    if not kept:
+        # Pathological case: don't reject everything.
+        kept = list(arr)
+    final = float(np.median(kept))
+    spread = float(np.std(kept)) if len(kept) > 1 else 0.0
+    rel_spread = spread / final if final > 0 else float("inf")
+    quality_note = (
+        "TIGHT" if rel_spread < 0.05
+        else "ACCEPTABLE" if rel_spread < 0.15
+        else "SUSPECT — investigate"
+    )
     print(
         f"[moge] final scale = {final:.4f} m/unit "
-        f"(per-frame std = {spread:.4f}, n_frames = {len(per_frame_scales)}, "
+        f"(kept {len(kept)}/{len(per_frame_scales)} frames, "
+        f"std/median = {rel_spread:.1%}, {quality_note}, "
         f"n_corr = {total_corr})"
     )
     return MoGeScaleResult(
         scale=final,
         per_frame_scales=per_frame_scales,
         num_correspondences=total_corr,
-        num_frames_used=len(per_frame_scales),
+        num_frames_used=len(kept),
     )

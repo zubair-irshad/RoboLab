@@ -76,8 +76,10 @@ def parse_args() -> argparse.Namespace:
              "GPU. Install: `pip install git+https://github.com/microsoft/MoGe.git`",
     )
     p.add_argument(
-        "--moge-num-frames", type=int, default=5,
-        help="number of evenly-spaced frames to run MoGe on.",
+        "--moge-num-frames", type=int, default=20,
+        help="number of evenly-spaced frames to run MoGe on. With FoV "
+             "passed from COLMAP intrinsics + MAD outlier rejection, 20 "
+             "gives a tight median; bump higher for fragile scenes.",
     )
     p.add_argument(
         "--moge-device", default="cuda",
@@ -211,7 +213,9 @@ def main() -> int:
     )
     print(
         f"[prepare] gravity (colmap frame) = {aligned.gravity_world_colmap.round(3).tolist()}\n"
-        f"           scale = {aligned.scale:.4f}\n"
+        f"           scale = {aligned.scale:.4f} m/colmap_unit\n"
+        f"           gravity refinement = {aligned.gravity_refinement_deg:.2f}° "
+        f"({'applied' if aligned.gravity_refinement_deg > 0 else 'none'})\n"
         f"           median camera height (post-align) = {aligned.median_camera_height_m:.2f} m\n"
         f"           floor quality score = {aligned.quality_score:.2f} (0–1, higher is better)"
     )
@@ -235,8 +239,10 @@ def main() -> int:
         "world_from_colmap_4x4": aligned.world_from_colmap_4x4().tolist(),
         "scale": aligned.scale,
         "gravity_world_colmap": aligned.gravity_world_colmap.tolist(),
+        "gravity_refinement_deg": aligned.gravity_refinement_deg,
         "median_camera_height_m": aligned.median_camera_height_m,
         "floor_quality_score": aligned.quality_score,
+        "floor_z_pre_translate_m": aligned.floor_z_pre_translate_m,
         "metric_scale_hint": args.metric_scale_hint,
         "target_camera_height_m": args.target_camera_height_m,
         "scale_source": (
