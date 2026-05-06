@@ -37,10 +37,12 @@
 #   ALPHA_M          (0.20)                 alpha radius (m) for alpha-shape
 #   OPACITY_THRESH   (0.05)                 sigmoid(opacity) cutoff for 3DGS PLYs (0 = no filter)
 #   N_PLACEMENTS     (12)                   how many task placements to sample
-#   FOOTPRINT_LEN    (1.5)                  task footprint length (m) along +X
-#   FOOTPRINT_WID    (1.0)                  task footprint width  (m) along +Y
-#   ROBOT_REACH      (0.85)                 lateral arm reach beyond footprint (m)
-#   FLOOR_CLOSE_M    (0.5)                  morph-closing radius on the floor mask (m)
+#   FOOTPRINT_LEN    (1.0)                  task footprint length (m) along +X. Bump to 1.5 for full-size kitchen scenes.
+#   FOOTPRINT_WID    (0.7)                  task footprint width  (m) along +Y
+#   ROBOT_REACH      (0.55)                 lateral arm reach beyond footprint (m). 0.85 (Franka full reach) usually fails inside small rooms; the placement check is conservative.
+#   CLEARANCE_M      (1.8)                  top of robot working volume (m). Walls in [TABLE_HEIGHT_M, CLEARANCE_M] are "high obstacles"; lower this to ignore upper walls/cabinets that the robot won't actually hit.
+#   TABLE_HEIGHT_M   (0.75)                 split between low-obstacle and high-obstacle bands (m).
+#   FLOOR_CLOSE_M    (1.0)                  morph-closing radius on the floor mask (m). Higher bridges floor gaps where furniture occluded capture.
 #   THREEDGRUT_REPO  (third_party/3dgrut)   local clone of nv-tlabs/3dgrut
 #   THREEDGRUT_ENV   ("")                   conda env for 3DGUT (empty = current env)
 #   SKIP_PREP        (0)                    set 1 to skip prepare_marble_scene
@@ -71,10 +73,12 @@ POISSON_DEPTH="${POISSON_DEPTH:-9}"
 ALPHA_M="${ALPHA_M:-0.20}"
 OPACITY_THRESH="${OPACITY_THRESH:-0.05}"
 N_PLACEMENTS="${N_PLACEMENTS:-12}"
-FOOTPRINT_LEN="${FOOTPRINT_LEN:-1.5}"
-FOOTPRINT_WID="${FOOTPRINT_WID:-1.0}"
-ROBOT_REACH="${ROBOT_REACH:-0.85}"
-FLOOR_CLOSE_M="${FLOOR_CLOSE_M:-0.5}"
+FOOTPRINT_LEN="${FOOTPRINT_LEN:-1.0}"
+FOOTPRINT_WID="${FOOTPRINT_WID:-0.7}"
+ROBOT_REACH="${ROBOT_REACH:-0.55}"
+CLEARANCE_M="${CLEARANCE_M:-1.8}"
+TABLE_HEIGHT_M="${TABLE_HEIGHT_M:-0.75}"
+FLOOR_CLOSE_M="${FLOOR_CLOSE_M:-1.0}"
 THREEDGRUT_REPO="${THREEDGRUT_REPO:-third_party/3dgrut}"
 THREEDGRUT_ENV="${THREEDGRUT_ENV:-}"
 SKIP_PREP="${SKIP_PREP:-0}"
@@ -95,6 +99,7 @@ else
 fi
 echo "  proxy method  : $PROXY_METHOD"
 echo "  3dgrut repo   : $THREEDGRUT_REPO"
+echo "  placements    : ${N_PLACEMENTS} x footprint ${FOOTPRINT_LEN}x${FOOTPRINT_WID} m, reach ${ROBOT_REACH} m, clearance ${CLEARANCE_M} m"
 echo "============================================================"
 
 mkdir -p "$OUT"
@@ -177,6 +182,8 @@ else
         --footprint-len "$FOOTPRINT_LEN" \
         --footprint-wid "$FOOTPRINT_WID" \
         --robot-reach "$ROBOT_REACH" \
+        --clearance "$CLEARANCE_M" \
+        --table-height "$TABLE_HEIGHT_M" \
         --floor-close-radius "$FLOOR_CLOSE_M" \
         --camera-floor-radius 0
 fi
