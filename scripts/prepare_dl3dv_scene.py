@@ -210,7 +210,7 @@ def main() -> int:
     print(f"[prepare] wrote {meta_path}")
 
     print("\n[prepare] next: visualize with")
-    print(f"    python scripts/visualize_dl3dv_scene_in_isaac.py --scene-dir {out_root}")
+    print(f"    python scripts/visualize_dl3dv_alignment.py --scene-dir {out_root}")
     return 0
 
 

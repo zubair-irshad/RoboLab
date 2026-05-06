@@ -123,14 +123,24 @@ def run_fast_pgsr(
                 f"checking for the fusion mesh on disk anyway..."
             )
 
-    # Discover the produced mesh. fast-pgsr writes to
-    # <model_path>/<split>/ours_<iter>/mesh/{mesh_color,mesh_nocolor}.ply
-    # (we trained with --skip_test so split = "train").
+    # Discover the produced mesh. fast-pgsr writes any of (depending on
+    # code path / version):
+    #   <model_path>/mesh/{tsdf_fusion,tsdf_fusion_post}.ply
+    #   <model_path>/train/ours_<iter>/mesh/{mesh_color,mesh_nocolor}.ply
+    #
+    # Prefer cluster-filtered variants — _post drops disconnected TSDF
+    # "shadow" floaters that otherwise contaminate floor detection.
+    preferred_names = (
+        "tsdf_fusion_post.ply",  # cluster-filtered TSDF (cleanest)
+        "mesh_color.ply",         # alt naming, also cluster-filtered if --num_cluster 1
+        "tsdf_fusion.ply",        # raw TSDF (has floaters)
+        "mesh_nocolor.ply",       # geometry only
+    )
     mesh_dir_candidates = list(model_path.rglob("mesh"))
     for mesh_dir in sorted(mesh_dir_candidates, key=lambda p: p.stat().st_mtime, reverse=True):
         if not mesh_dir.is_dir():
             continue
-        for name in ("mesh_color.ply", "mesh_nocolor.ply"):
+        for name in preferred_names:
             candidate = mesh_dir / name
             if candidate.is_file() and candidate.stat().st_size > 0:
                 print(f"[fast-pgsr] mesh -> {candidate}")

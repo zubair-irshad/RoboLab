@@ -185,29 +185,64 @@ class AlignedScene:
         return T
 
 
-def _floor_z_from_mesh(vertices_aligned: np.ndarray, low_pct: float = 1.0) -> float:
-    return float(np.percentile(vertices_aligned[:, 2], low_pct))
-
-
-def _quality_score(
+def _ransac_floor_plane(
     vertices_aligned: np.ndarray,
-    floor_z: float,
-    floor_band: float = 0.05,
-) -> float:
-    """How planar is the lowest 5cm slab in the aligned frame? Higher = better.
+    *,
+    lower_pct: float = 30.0,
+    inlier_thresh: float = 0.03,
+    max_normal_dev_deg: float = 25.0,
+    max_iters: int = 400,
+    rng_seed: int = 0,
+) -> tuple[float, float]:
+    """Find the floor z + inlier fraction by RANSAC plane fit.
 
-    A real floor produces a thin slab; a mis-aligned scene produces a
-    wedge. We measure inverse-thickness in the slab with vertices in the
-    bottom 10% by z.
+    Restricts to vertices in the lower ``lower_pct`` of z so we don't
+    accidentally lock onto a tabletop. Rejects plane candidates whose
+    normal deviates from +Z by more than ``max_normal_dev_deg`` (so we
+    reject vertical walls). The largest inlier set wins.
+
+    Returns ``(floor_z, inlier_fraction)`` where ``inlier_fraction`` is
+    the fraction of *lower-portion* vertices on the winning plane —
+    high values (>0.4) indicate a strong, dense floor; low values
+    indicate the lower portion is dominated by floaters.
+
+    Robust to TSDF "shadow" artifacts: those are sparse and unaligned,
+    so they accumulate few inliers and lose to the real floor.
     """
     z = vertices_aligned[:, 2]
-    lo = floor_z
-    hi = lo + max(floor_band, 0.5 * (np.percentile(z, 10) - lo))
-    band = vertices_aligned[(z >= lo) & (z <= hi)]
-    if len(band) < 100:
-        return 0.0
-    spread = float(np.std(band[:, 2]))
-    return float(np.clip(1.0 - spread / floor_band, 0.0, 1.0))
+    z_thresh = float(np.percentile(z, lower_pct))
+    candidates = vertices_aligned[z <= z_thresh]
+    if len(candidates) < 100:
+        return float(np.median(z)), 0.0
+
+    rng = np.random.default_rng(rng_seed)
+    if len(candidates) > 20_000:
+        candidates = candidates[rng.choice(len(candidates), 20_000, replace=False)]
+
+    cos_thresh = float(np.cos(np.deg2rad(max_normal_dev_deg)))
+    up = np.array([0.0, 0.0, 1.0])
+
+    best_inliers = 0
+    best_z = float(np.median(candidates[:, 2]))
+    for _ in range(max_iters):
+        idx = rng.choice(len(candidates), 3, replace=False)
+        p0, p1, p2 = candidates[idx]
+        n = np.cross(p1 - p0, p2 - p0)
+        nn = float(np.linalg.norm(n))
+        if nn < 1e-9:
+            continue
+        n = n / nn
+        if abs(float(n @ up)) < cos_thresh:
+            continue  # skip non-horizontal candidates
+        d = -float(n @ p0)
+        dists = np.abs(candidates @ n + d)
+        n_in = int((dists < inlier_thresh).sum())
+        if n_in > best_inliers:
+            best_inliers = n_in
+            inlier_pts = candidates[dists < inlier_thresh]
+            best_z = float(np.median(inlier_pts[:, 2]))
+
+    return best_z, best_inliers / len(candidates)
 
 
 def align_scene_from_mesh(
@@ -258,7 +293,7 @@ def align_scene_from_mesh(
     verts_rot = verts @ R_align.T
     cam_centers_rot = t_wc @ R_align.T
 
-    floor_z = _floor_z_from_mesh(verts_rot)
+    floor_z, floor_inlier_frac = _ransac_floor_plane(verts_rot)
     t_align = np.array([0.0, 0.0, -floor_z])
 
     median_cam_height_pre_scale = float(np.median(cam_centers_rot[:, 2] - floor_z))
@@ -273,8 +308,7 @@ def align_scene_from_mesh(
     else:
         scale = target_camera_height_m / median_cam_height_pre_scale
 
-    verts_final = scale * (verts_rot + t_align)
-    quality = _quality_score(verts_final, floor_z=0.0)
+    quality = floor_inlier_frac
 
     return AlignedScene(
         R_align=R_align,
