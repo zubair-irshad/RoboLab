@@ -45,6 +45,8 @@
 #   FLOOR_CLOSE_M    (1.0)                  morph-closing radius on the floor mask (m). Higher bridges floor gaps where furniture occluded capture.
 #   MIN_FLOOR_AREA_M2 (3.0)                  drop floor connected-components smaller than this (m²). Filters RANSAC false-positives in adjacent rooms / on furniture. Set 0 to disable.
 #   MIN_FREE_AREA_M2  (1.0)                  drop tiny components from the FINAL free-placement mask. Catches the 'doorway peninsula' failure mode where a passage survives the floor-area filter but yields only a sliver of valid cells. Set 0 to disable.
+#   FLOOR_DEFINITION  (occupied-column)      'occupied-column' = floor wherever the column's lowest mesh point is near floor_z (best for synthesis-based PLYs where gaussians cluster on furniture). 'ransac' = only RANSAC inliers count (best when capture has dense bare-floor coverage).
+#   FLOOR_Z_TOL_M     (0.15)                 occupied-column tolerance: how far above floor_z the lowest mesh point may sit and still count as floor.
 #   THREEDGRUT_REPO  (third_party/3dgrut)   local clone of nv-tlabs/3dgrut
 #   THREEDGRUT_ENV   ("")                   conda env for 3DGUT (empty = current env)
 #   SKIP_PREP        (0)                    set 1 to skip prepare_marble_scene
@@ -83,6 +85,8 @@ TABLE_HEIGHT_M="${TABLE_HEIGHT_M:-0.75}"
 FLOOR_CLOSE_M="${FLOOR_CLOSE_M:-1.0}"
 MIN_FLOOR_AREA_M2="${MIN_FLOOR_AREA_M2:-3.0}"
 MIN_FREE_AREA_M2="${MIN_FREE_AREA_M2:-1.0}"
+FLOOR_DEFINITION="${FLOOR_DEFINITION:-occupied-column}"
+FLOOR_Z_TOL_M="${FLOOR_Z_TOL_M:-0.15}"
 THREEDGRUT_REPO="${THREEDGRUT_REPO:-third_party/3dgrut}"
 THREEDGRUT_ENV="${THREEDGRUT_ENV:-}"
 SKIP_PREP="${SKIP_PREP:-0}"
@@ -191,6 +195,8 @@ else
         --floor-close-radius "$FLOOR_CLOSE_M" \
         --min-floor-area-m2 "$MIN_FLOOR_AREA_M2" \
         --min-free-area-m2 "$MIN_FREE_AREA_M2" \
+        --floor-definition "$FLOOR_DEFINITION" \
+        --floor-z-tolerance-m "$FLOOR_Z_TOL_M" \
         --camera-floor-radius 0
 fi
 

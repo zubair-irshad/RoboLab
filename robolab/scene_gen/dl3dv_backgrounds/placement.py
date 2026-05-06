@@ -100,6 +100,8 @@ def _build_topdown_grids(
     clearance_m: float = 2.5,
     floor_band_m: float = 0.05,
     table_height_m: float = 0.75,
+    floor_definition: str = "occupied-column",
+    floor_z_tolerance_m: float = 0.15,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[float, float, float, float]]:
     """Return ``(low_obs, high_obs, has_floor, (xmin, ymin, xmax, ymax))``.
 
@@ -115,8 +117,24 @@ def _build_topdown_grids(
       placement next to a sofa stays valid as long as the airspace
       above the sofa is clear.
 
-      ``has_floor`` — RANSAC-inlier floor vertices. Required so we
-      don't sample placements outside the captured room boundary.
+      ``has_floor`` — boolean per-cell mask of where the floor is
+      believed to exist. Two definitions are supported:
+
+        ``ransac`` — only cells where a RANSAC floor inlier landed.
+        Conservative; works well when cameras directly captured the
+        floor (DL3DV). Fragile on synthesis-based scenes (Marble,
+        Echo2) where gaussians cluster on furniture and leave the
+        actual floor sparsely covered.
+
+        ``occupied-column`` (default) — every xy cell whose **lowest**
+        mesh point sits within ``floor_z_tolerance_m`` of the RANSAC
+        floor z. Fills in occluded floor: a vanity at xy=(1,1) has its
+        base on the floor, so the lowest point at that xy is at
+        floor_z and the cell is correctly marked as floor (the vanity
+        itself is also marked as a low obstacle in ``low_obs``, which
+        the caller's erosion handles separately). Walls at floor cells
+        likewise become floor *and* high obstacles — the high-obstacle
+        erosion still removes them from valid placements.
 
     TSDF "shadow" floaters at z < -0.1 are filtered everywhere.
     """
@@ -135,7 +153,7 @@ def _build_topdown_grids(
     verts = np.asarray(mesh.vertices, dtype=np.float64)
     z = verts[:, 2]
 
-    _, _, floor_mask = _ransac_floor_plane(verts, return_mask=True)
+    floor_z, _, ransac_mask = _ransac_floor_plane(verts, return_mask=True)
 
     valid_height = (z > floor_band_m) & (z < clearance_m) & (z > -0.1)
     is_low = valid_height & (z <= table_height_m)
@@ -143,12 +161,13 @@ def _build_topdown_grids(
 
     low_pts = verts[is_low, :2]
     high_pts = verts[is_high, :2]
-    floor_pts = verts[floor_mask, :2]
+    ransac_floor_pts = verts[ransac_mask, :2]
 
-    if len(low_pts) == 0 and len(high_pts) == 0 and len(floor_pts) == 0:
+    if len(low_pts) == 0 and len(high_pts) == 0 and len(ransac_floor_pts) == 0:
         raise RuntimeError("no usable vertices found — mesh empty or alignment broken?")
 
-    pieces = [a for a in (low_pts, high_pts, floor_pts) if len(a) > 0]
+    # Bounding box: take all relevant points so the grid covers everything.
+    pieces = [a for a in (low_pts, high_pts, ransac_floor_pts) if len(a) > 0]
     all_pts = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
     xmin, ymin = all_pts.min(axis=0)
     xmax, ymax = all_pts.max(axis=0)
@@ -169,7 +188,36 @@ def _build_topdown_grids(
 
     low_obs = _rasterize(low_pts)
     high_obs = _rasterize(high_pts)
-    has_floor = _rasterize(floor_pts)
+
+    if floor_definition == "ransac":
+        has_floor = _rasterize(ransac_floor_pts)
+    elif floor_definition == "occupied-column":
+        # Per-cell minimum-z reduction. We fill an HxW grid with +inf,
+        # then for every vertex update the cell to min(current, z).
+        # numpy.minimum.at handles repeated indices correctly.
+        valid = z > -0.1  # drop TSDF shadows
+        v_xy = verts[valid, :2]
+        v_z = z[valid]
+        ix = np.clip(((v_xy[:, 0] - xmin) / cell_size_m).astype(int), 0, W - 1)
+        iy = np.clip(((v_xy[:, 1] - ymin) / cell_size_m).astype(int), 0, H - 1)
+        cell_min_z = np.full((H, W), np.inf, dtype=np.float64)
+        np.minimum.at(cell_min_z, (iy, ix), v_z)
+        # Floor exists wherever the column's lowest mesh point is at
+        # floor level (within tolerance). +inf cells (no mesh in column)
+        # stay False naturally.
+        has_floor = cell_min_z <= (floor_z + floor_z_tolerance_m)
+        n_ransac_cells = int(_rasterize(ransac_floor_pts).sum())
+        n_column_cells = int(has_floor.sum())
+        print(
+            f"[placement] floor: occupied-column at floor_z={floor_z:.3f} m "
+            f"± {floor_z_tolerance_m:.2f} m -> {n_column_cells:,} cells "
+            f"(vs RANSAC-only: {n_ransac_cells:,} cells)"
+        )
+    else:
+        raise ValueError(
+            f"unknown floor_definition {floor_definition!r}; "
+            f"expected 'ransac' or 'occupied-column'"
+        )
     return low_obs, high_obs, has_floor, (xmin, ymin, xmax, ymax)
 
 
@@ -310,6 +358,8 @@ def sample_placements(
     camera_floor_radius_m: float = 1.5,
     min_floor_area_m2: float = 3.0,
     min_free_area_m2: float = 1.0,
+    floor_definition: str = "occupied-column",
+    floor_z_tolerance_m: float = 0.15,
 ) -> list[Placement]:
     """Sample ``n_placements`` valid foreground poses on the aligned floor.
 
@@ -333,6 +383,8 @@ def sample_placements(
         cell_size_m=cell_size_m,
         clearance_m=footprint.clearance_m,
         table_height_m=footprint.table_height_m,
+        floor_definition=floor_definition,
+        floor_z_tolerance_m=floor_z_tolerance_m,
     )
 
     # Close the floor mask to bridge gaps caused by furniture occluding

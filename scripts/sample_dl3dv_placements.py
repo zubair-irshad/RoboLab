@@ -60,6 +60,12 @@ def _render(
     cam_centers: np.ndarray,
     robot_reach_m: float,
     out_path: Path,
+    aligned_mesh_path: Path,
+    floor_definition: str = "occupied-column",
+    floor_z_tolerance_m: float = 0.15,
+    cell_size_m: float = 0.05,
+    table_height_m: float = 0.75,
+    clearance_m: float = 2.5,
 ) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -67,15 +73,33 @@ def _render(
     from matplotlib.patches import Circle, Polygon
 
     from robolab.scene_gen.dl3dv_backgrounds.align import _ransac_floor_plane
+    from robolab.scene_gen.dl3dv_backgrounds.placement import _build_topdown_grids
 
-    # Floor inliers (where actual captured floor lives) — show in green
-    # so you can see at a glance whether placements land *inside* the
-    # captured room or outside it.
-    _, _, floor_mask = _ransac_floor_plane(verts, return_mask=True)
-    floor_pts = verts[floor_mask][:, :2]
-    if len(floor_pts) > 100_000:
-        idx = np.random.default_rng(0).choice(len(floor_pts), 100_000, replace=False)
-        floor_pts = floor_pts[idx]
+    # Show the *actual* floor mask used by the placement algorithm — not
+    # just RANSAC inliers — so the viz matches what the planner saw.
+    # For ``occupied-column`` mode this fills in furniture-occluded
+    # floor cells; for ``ransac`` mode it's identical to the inliers.
+    _, _, has_floor_used, (xmin, ymin, _, _) = _build_topdown_grids(
+        aligned_mesh_path,
+        cell_size_m=cell_size_m,
+        clearance_m=clearance_m,
+        table_height_m=table_height_m,
+        floor_definition=floor_definition,
+        floor_z_tolerance_m=floor_z_tolerance_m,
+    )
+    iy, ix = np.where(has_floor_used)
+    floor_xy_used = np.column_stack([
+        xmin + (ix + 0.5) * cell_size_m,
+        ymin + (iy + 0.5) * cell_size_m,
+    ])
+
+    # Also overlay the (typically-sparser) RANSAC inliers so you can see
+    # at a glance how much "fill-in" the occupied-column rule gave you.
+    _, _, ransac_mask = _ransac_floor_plane(verts, return_mask=True)
+    ransac_xy = verts[ransac_mask][:, :2]
+    if len(ransac_xy) > 100_000:
+        idx = np.random.default_rng(0).choice(len(ransac_xy), 100_000, replace=False)
+        ransac_xy = ransac_xy[idx]
 
     # Non-floor obstacles — gray
     pts = verts[(verts[:, 2] > 0.05) & (verts[:, 2] < 2.5)][:, :2]
@@ -84,8 +108,10 @@ def _render(
         pts = pts[idx]
 
     fig, ax = plt.subplots(figsize=(10, 10))
-    ax.scatter(floor_pts[:, 0], floor_pts[:, 1], s=0.3, c="#3cb371",
-               alpha=0.4, label="captured floor (RANSAC)")
+    ax.scatter(floor_xy_used[:, 0], floor_xy_used[:, 1], s=0.5, c="#a0d8b3",
+               alpha=0.55, label=f"floor mask used ({floor_definition})")
+    ax.scatter(ransac_xy[:, 0], ransac_xy[:, 1], s=0.4, c="#117a3a",
+               alpha=0.7, label="RANSAC inliers")
     ax.scatter(pts[:, 0], pts[:, 1], s=0.3, c="#444", alpha=0.5, label="non-floor mesh")
     ax.scatter(cam_centers[:, 0], cam_centers[:, 1],
                s=12, c="#d62728", alpha=0.8, label="cameras")
@@ -197,6 +223,24 @@ def main() -> int:
              "contributes a thin sliver of valid placement cells. "
              "Pass 0 to disable. Default 1 m² ≈ a few placements' worth.",
     )
+    p.add_argument(
+        "--floor-definition", choices=("occupied-column", "ransac"),
+        default="occupied-column",
+        help="how to decide which xy cells count as floor. "
+             "'occupied-column' (default): every cell whose lowest "
+             "mesh point is within --floor-z-tolerance of the RANSAC "
+             "floor — fills in furniture-occluded floor. Best for "
+             "synthesis-based scenes (Marble, Echo2). 'ransac': only "
+             "cells where a RANSAC floor inlier landed — conservative; "
+             "use when synthesis fill-in produces false positives.",
+    )
+    p.add_argument(
+        "--floor-z-tolerance-m", type=float, default=0.15,
+        help="how far above the RANSAC floor z a column's lowest mesh "
+             "point may be and still count as floor. 0.15 m allows "
+             "thin rugs / floor noise without flagging table tops "
+             "(typically ≥ 0.4 m up).",
+    )
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -248,6 +292,8 @@ def main() -> int:
         camera_floor_radius_m=args.camera_floor_radius,
         min_floor_area_m2=args.min_floor_area_m2,
         min_free_area_m2=args.min_free_area_m2,
+        floor_definition=args.floor_definition,
+        floor_z_tolerance_m=args.floor_z_tolerance_m,
     )
 
     out_json = scene_dir / "placements.json"
@@ -269,6 +315,12 @@ def main() -> int:
         scene_dir, verts=verts, placements=placements,
         cam_centers=cam_centers, robot_reach_m=args.robot_reach,
         out_path=out_png,
+        aligned_mesh_path=aligned_mesh,
+        floor_definition=args.floor_definition,
+        floor_z_tolerance_m=args.floor_z_tolerance_m,
+        cell_size_m=args.cell_size,
+        table_height_m=args.table_height,
+        clearance_m=args.clearance,
     )
     print(f"[placements] wrote viz → {out_png}")
     return 0
