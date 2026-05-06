@@ -254,6 +254,8 @@ def sample_placements(
     floor_close_radius_m: float = 0.5,
     sampling: str = "farthest_point",
     min_separation_m: float = 0.5,
+    camera_centers_world: np.ndarray | None = None,
+    max_camera_distance_m: float | None = None,
 ) -> list[Placement]:
     """Sample ``n_placements`` valid foreground poses on the aligned floor.
 
@@ -326,10 +328,39 @@ def sample_placements(
         ymin + (iy + 0.5) * cell_size_m,
     ])
 
+    # Optionally bias to placements near training-camera positions —
+    # the GS/NuRec rendering quality is best where the training cameras
+    # actually saw the scene. Filtering placements to within
+    # ``max_camera_distance_m`` of a training camera puts the rendering
+    # hemisphere in the well-covered sweet spot, avoiding smeared
+    # walls/ceiling from out-of-distribution view angles.
+    if camera_centers_world is not None and max_camera_distance_m is not None:
+        cam_xy = np.asarray(camera_centers_world)[:, :2]
+        # Compute min xy distance from each candidate cell to any camera.
+        # Vectorized — fine up to a few thousand cells × cameras.
+        min_dists = np.linalg.norm(
+            cell_xy[:, None, :] - cam_xy[None, :, :], axis=-1
+        ).min(axis=1)
+        near = min_dists <= max_camera_distance_m
+        n_kept = int(near.sum())
+        n_total = len(cell_xy)
+        if n_kept == 0:
+            raise RuntimeError(
+                f"no free cells within {max_camera_distance_m} m of any "
+                f"training camera ({n_total} candidates were considered). "
+                f"Increase --max-distance-to-camera or drop the flag."
+            )
+        cell_xy = cell_xy[near]
+        print(
+            f"[placement] camera-distance filter: kept {n_kept}/{n_total} cells "
+            f"within {max_camera_distance_m} m of a training camera"
+        )
+
     if sampling == "farthest_point":
         pick = _farthest_point_sample(cell_xy, n_placements, rng)
     elif sampling == "random":
-        pick = rng.choice(len(ix), size=min(n_placements, len(ix)), replace=False)
+        pick = rng.choice(len(cell_xy), size=min(n_placements, len(cell_xy)),
+                          replace=False)
     else:
         raise ValueError(f"unknown sampling strategy {sampling!r}")
 

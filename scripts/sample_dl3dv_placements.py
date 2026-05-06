@@ -167,6 +167,14 @@ def main() -> int:
                    help="minimum xy distance (m) between sampled placements. "
                         "Hard floor on cluster collapse — picks closer than "
                         "this get dropped.")
+    p.add_argument(
+        "--max-distance-to-camera", type=float, default=None,
+        help="if set, only sample placements whose xy is within this many "
+             "metres of a training camera position. The DL3DV operator only "
+             "captured certain regions densely; rendering from a placement "
+             "far from any camera produces blurry/smeared walls. Try 1.5–2.5 "
+             "metres for typical handheld captures.",
+    )
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -183,6 +191,14 @@ def main() -> int:
         robot_reach_m=args.robot_reach,
         table_height_m=args.table_height,
     )
+    # If we'll filter by camera distance, derive camera centres in aligned
+    # world frame up front (same math the rerun viz uses).
+    cam_centers_world = None
+    if args.max_distance_to_camera is not None:
+        R_wc, t_wc = _read_images_metadata(Path(metadata["colmap_source_path"]))
+        T = np.asarray(metadata["world_from_colmap_4x4"])
+        cam_centers_world = (T[:3, :3] @ t_wc.T).T + T[:3, 3]
+
     placements = sample_placements(
         aligned_mesh_path=aligned_mesh,
         n_placements=args.n,
@@ -193,6 +209,8 @@ def main() -> int:
         floor_close_radius_m=args.floor_close_radius,
         sampling=args.sampling,
         min_separation_m=args.min_separation,
+        camera_centers_world=cam_centers_world,
+        max_camera_distance_m=args.max_distance_to_camera,
     )
 
     out_json = scene_dir / "placements.json"
