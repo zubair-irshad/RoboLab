@@ -199,12 +199,22 @@ def main() -> int:
     # Derive camera centres in aligned world frame. We need them whenever
     # camera-floor-radius > 0 (uses cam positions as floor evidence) OR
     # max-distance-to-camera is set (filters placements near cameras).
+    # Marble / Echo2 scenes have no cameras (metadata.colmap_source_path is
+    # null); silently degrade those flags to no-op rather than crashing.
+    colmap_src = metadata.get("colmap_source_path")
+    has_cams = bool(colmap_src) and Path(colmap_src).exists()
     needs_cams = args.camera_floor_radius > 0 or args.max_distance_to_camera is not None
     cam_centers_world = None
-    if needs_cams:
-        R_wc, t_wc = _read_images_metadata(Path(metadata["colmap_source_path"]))
+    if needs_cams and has_cams:
+        R_wc, t_wc = _read_images_metadata(Path(colmap_src))
         T = np.asarray(metadata["world_from_colmap_4x4"])
         cam_centers_world = (T[:3, :3] @ t_wc.T).T + T[:3, 3]
+    elif needs_cams and not has_cams:
+        print(
+            "[placements] no colmap_source_path in metadata "
+            "(marble / echo2 scene?); ignoring --camera-floor-radius and "
+            "--max-distance-to-camera."
+        )
 
     placements = sample_placements(
         aligned_mesh_path=aligned_mesh,
@@ -225,10 +235,14 @@ def main() -> int:
     write_placements_json(placements, out_json)
     print(f"[placements] wrote {len(placements)} poses → {out_json}")
 
-    # Re-derive camera centres in aligned frame for the overlay
-    R_wc, t_wc = _read_images_metadata(Path(metadata["colmap_source_path"]))
-    T = np.asarray(metadata["world_from_colmap_4x4"])
-    cam_centers = (T[:3, :3] @ t_wc.T).T + T[:3, 3]
+    # Re-derive camera centres in aligned frame for the overlay (empty
+    # array when there are no cameras, e.g. marble / echo2).
+    if has_cams:
+        R_wc, t_wc = _read_images_metadata(Path(colmap_src))
+        T = np.asarray(metadata["world_from_colmap_4x4"])
+        cam_centers = (T[:3, :3] @ t_wc.T).T + T[:3, 3]
+    else:
+        cam_centers = np.empty((0, 3), dtype=np.float64)
 
     verts = _load_mesh_vertices(aligned_mesh)
     out_png = scene_dir / "viz_placements.png"

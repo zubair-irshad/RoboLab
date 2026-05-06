@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: CC-BY-NC-4.0
+#
+# End-to-end pipeline for a single Marble / Echo2 Gaussian-splat PLY
+# (no COLMAP, no images, no fast-pgsr — just the .ply):
+#
+#   1. prepare_marble_scene.py    → mesh_aligned.ply + metadata.json
+#   2. dl3dv_mesh_to_usd.py       → mesh_aligned.usd (depth collider)
+#   3. dl3dv_gs_to_usdz.py        → gaussians.usdz   (rgb visual via 3DGUT)
+#   4. sample_dl3dv_placements.py → placements.json + viz_placements.png
+#
+# After this lands, render with:
+#
+#   PYTHONPATH=. python scripts/render_dl3dv_with_robot.py \
+#       --task UtensilsInMugTask \
+#       --scene-dir <output-dir> \
+#       --placement-idx 0 --num-views 12 --spp 64
+#
+# Usage:
+#   bash scripts/build_marble_scene.sh <PLY_PATH> [OUTPUT_DIR]
+#
+# Examples:
+#   bash scripts/build_marble_scene.sh data/echo-2/Designer_Bath_Laundry_Nook.ply
+#   UP_AXIS=+z CEILING_M=2.4 bash scripts/build_marble_scene.sh foo.ply out/foo
+#
+# Env-var overrides (with defaults):
+#   UP_AXIS          (+y)                   PLY's up axis (Marble = +y, COLMAP-y-up = -y)
+#   METRIC_SCALE     (unset → ceiling)      explicit PLY-units → metres scalar
+#   CEILING_M        (2.7)                  ceiling-height heuristic target (only when METRIC_SCALE unset)
+#   PROXY_METHOD     (poisson)              poisson | alpha | voxel-points
+#   VOXEL_M          (0.05)                 voxel downsample size (m) for proxy mesh
+#   POISSON_DEPTH    (9)                    octree depth for Poisson reconstruction
+#   ALPHA_M          (0.20)                 alpha radius (m) for alpha-shape
+#   OPACITY_THRESH   (0.05)                 sigmoid(opacity) cutoff for 3DGS PLYs (0 = no filter)
+#   N_PLACEMENTS     (12)                   how many task placements to sample
+#   FOOTPRINT_LEN    (1.5)                  task footprint length (m) along +X
+#   FOOTPRINT_WID    (1.0)                  task footprint width  (m) along +Y
+#   ROBOT_REACH      (0.85)                 lateral arm reach beyond footprint (m)
+#   FLOOR_CLOSE_M    (0.5)                  morph-closing radius on the floor mask (m)
+#   THREEDGRUT_REPO  (third_party/3dgrut)   local clone of nv-tlabs/3dgrut
+#   THREEDGRUT_ENV   ("")                   conda env for 3DGUT (empty = current env)
+#   SKIP_PREP        (0)                    set 1 to skip prepare_marble_scene
+#   SKIP_MESH_USD    (0)                    set 1 to skip mesh_aligned.usd
+#   SKIP_GS_USDZ     (0)                    set 1 to skip 3DGUT (gaussians.usdz)
+#   SKIP_PLACEMENTS  (0)                    set 1 to skip placement sampling
+
+set -euo pipefail
+
+PLY="${1:?Usage: $0 <ply-file> [output-dir]}"
+if [[ ! -f "$PLY" ]]; then
+    echo "error: PLY not found: $PLY" >&2
+    exit 1
+fi
+
+# Default output directory: data/marble_backgrounds/scenes/<basename-no-ext>
+DEFAULT_OUT="data/marble_backgrounds/scenes/$(basename "${PLY%.ply}")"
+OUT="${2:-$DEFAULT_OUT}"
+
+UP_AXIS="${UP_AXIS:-+y}"
+METRIC_SCALE="${METRIC_SCALE:-}"
+CEILING_M="${CEILING_M:-2.7}"
+PROXY_METHOD="${PROXY_METHOD:-poisson}"
+VOXEL_M="${VOXEL_M:-0.05}"
+POISSON_DEPTH="${POISSON_DEPTH:-9}"
+ALPHA_M="${ALPHA_M:-0.20}"
+OPACITY_THRESH="${OPACITY_THRESH:-0.05}"
+N_PLACEMENTS="${N_PLACEMENTS:-12}"
+FOOTPRINT_LEN="${FOOTPRINT_LEN:-1.5}"
+FOOTPRINT_WID="${FOOTPRINT_WID:-1.0}"
+ROBOT_REACH="${ROBOT_REACH:-0.85}"
+FLOOR_CLOSE_M="${FLOOR_CLOSE_M:-0.5}"
+THREEDGRUT_REPO="${THREEDGRUT_REPO:-third_party/3dgrut}"
+THREEDGRUT_ENV="${THREEDGRUT_ENV:-}"
+SKIP_PREP="${SKIP_PREP:-0}"
+SKIP_MESH_USD="${SKIP_MESH_USD:-0}"
+SKIP_GS_USDZ="${SKIP_GS_USDZ:-0}"
+SKIP_PLACEMENTS="${SKIP_PLACEMENTS:-0}"
+
+echo "============================================================"
+echo "Marble scene pipeline"
+echo "  ply           : $PLY"
+echo "  output dir    : $OUT"
+echo "  up axis       : $UP_AXIS"
+if [[ -n "$METRIC_SCALE" ]]; then
+    echo "  metric scale  : $METRIC_SCALE (user)"
+else
+    echo "  metric scale  : (heuristic, target ceiling = $CEILING_M m)"
+fi
+echo "  proxy method  : $PROXY_METHOD"
+echo "  3dgrut repo   : $THREEDGRUT_REPO"
+echo "============================================================"
+
+mkdir -p "$OUT"
+
+# ------ 1: prepare ----------------------------------------------------------
+if [[ "$SKIP_PREP" == "1" ]]; then
+    echo
+    echo "[1/4] === SKIP_PREP=1; not running prepare_marble_scene ==="
+else
+    echo
+    echo "[1/4] === prepare_marble_scene (PLY -> aligned mesh + metadata) ==="
+    PREP_FLAGS=(
+        --ply "$PLY"
+        --out-dir "$OUT"
+        --up-axis "$UP_AXIS"
+        --opacity-threshold "$OPACITY_THRESH"
+        --proxy-method "$PROXY_METHOD"
+        --voxel-size-m "$VOXEL_M"
+        --poisson-depth "$POISSON_DEPTH"
+        --alpha-m "$ALPHA_M"
+    )
+    if [[ -n "$METRIC_SCALE" ]]; then
+        PREP_FLAGS+=(--metric-scale "$METRIC_SCALE")
+    else
+        PREP_FLAGS+=(--ceiling-height-m "$CEILING_M")
+    fi
+    python scripts/prepare_marble_scene.py "${PREP_FLAGS[@]}"
+fi
+
+# ------ 2: aligned mesh -> USD collider ------------------------------------
+if [[ "$SKIP_MESH_USD" == "1" ]]; then
+    echo
+    echo "[2/4] === SKIP_MESH_USD=1; not authoring mesh_aligned.usd ==="
+else
+    echo
+    echo "[2/4] === mesh_aligned.ply -> mesh_aligned.usd ==="
+    python scripts/dl3dv_mesh_to_usd.py --scene-dir "$OUT"
+fi
+
+# ------ 3: source PLY -> gaussians.usdz (3DGUT) ----------------------------
+if [[ "$SKIP_GS_USDZ" == "1" ]]; then
+    echo
+    echo "[3/4] === SKIP_GS_USDZ=1; not running 3DGUT ==="
+else
+    echo
+    echo "[3/4] === source.ply -> gaussians.usdz (3DGUT) ==="
+    python scripts/dl3dv_gs_to_usdz.py \
+        --scene-dir "$OUT" \
+        --threedgrut-repo "$THREEDGRUT_REPO" \
+        --conda-env "$THREEDGRUT_ENV" \
+        --ply "$PLY"
+fi
+
+# ------ 4: placement sampling ----------------------------------------------
+if [[ "$SKIP_PLACEMENTS" == "1" ]]; then
+    echo
+    echo "[4/4] === SKIP_PLACEMENTS=1; not sampling placements ==="
+else
+    echo
+    echo "[4/4] === sample placements ==="
+    # No COLMAP cameras → disable camera-aware floor evidence and the
+    # camera-distance filter. The placement script tolerates this and
+    # falls back to RANSAC-only floor coverage.
+    python scripts/sample_dl3dv_placements.py \
+        --scene-dir "$OUT" \
+        --n "$N_PLACEMENTS" \
+        --footprint-len "$FOOTPRINT_LEN" \
+        --footprint-wid "$FOOTPRINT_WID" \
+        --robot-reach "$ROBOT_REACH" \
+        --floor-close-radius "$FLOOR_CLOSE_M" \
+        --camera-floor-radius 0
+fi
+
+echo
+echo "=== DONE ==="
+echo "Scene artifacts under: $OUT"
+ls -lh "$OUT"/*.{ply,usd,usdz,json,png} 2>/dev/null || true
+
+cat <<EOF
+
+Render a robot view at placement 0:
+
+    PYTHONPATH=. python scripts/render_dl3dv_with_robot.py \\
+        --task UtensilsInMugTask \\
+        --scene-dir $OUT \\
+        --placement-idx 0 --num-views 12 --spp 64
+
+(The render script is shared with the DL3DV pipeline — it reads the
+same metadata.json + mesh_aligned.usd + gaussians.usdz layout we just
+produced. Use --no-gs to render mesh-only when 3DGUT was skipped.)
+EOF
