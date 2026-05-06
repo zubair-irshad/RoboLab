@@ -39,12 +39,11 @@ class FastPgsrConfig:
     extra_train_args: tuple[str, ...] = ()
     """Pass-through for branch-specific flags (e.g. --loss_thresh, --dense)."""
 
-    # TSDF-fusion knobs (fed to render.py). PGSR defaults are voxel=2mm /
-    # max_depth=5m, which produce huge meshes for room-scale scenes — we
-    # default to 1cm voxels and 10m cutoff to keep meshes manageable while
-    # still good enough for robot-scene collision.
-    tsdf_voxel_size: float = 0.01
-    tsdf_max_depth: float = 10.0
+    # TSDF-fusion knobs (fed to render.py). PGSR defaults (voxel=2mm,
+    # max_depth=5m) target object-scale; for room-scale collision use
+    # 2cm voxels + 6m cutoff is plenty and ~10x faster than 1cm/10m.
+    tsdf_voxel_size: float = 0.02
+    tsdf_max_depth: float = 6.0
     tsdf_num_cluster: int = 1
     use_depth_filter: bool = True
 
@@ -111,15 +110,31 @@ def run_fast_pgsr(
         ]
         if cfg.use_depth_filter:
             render_cmd.append("--use_depth_filter")
-        _conda_run(cfg.conda_env, repo, render_cmd)
+        # render.py has an upstream bug where it crashes after writing
+        # tsdf_fusion_post.ply but before saving an optional colored
+        # variant (NameError on `mesh_path`). The fusion mesh we want
+        # is already on disk by then, so we tolerate non-zero exit and
+        # let the post-condition check below decide success.
+        try:
+            _conda_run(cfg.conda_env, repo, render_cmd)
+        except subprocess.CalledProcessError as e:
+            print(
+                f"[fast-pgsr] render.py exited non-zero ({e.returncode}); "
+                f"checking for the fusion mesh on disk anyway..."
+            )
 
-    # Prefer the post-processed (cluster-filtered) mesh; fall back to raw.
-    mesh_dir = model_path / "mesh"
-    for name in ("tsdf_fusion_post.ply", "tsdf_fusion.ply"):
-        candidate = mesh_dir / name
-        if candidate.is_file():
-            print(f"[fast-pgsr] mesh -> {candidate}")
-            return candidate
+    # Discover the produced mesh. fast-pgsr writes to
+    # <model_path>/<split>/ours_<iter>/mesh/{mesh_color,mesh_nocolor}.ply
+    # (we trained with --skip_test so split = "train").
+    mesh_dir_candidates = list(model_path.rglob("mesh"))
+    for mesh_dir in sorted(mesh_dir_candidates, key=lambda p: p.stat().st_mtime, reverse=True):
+        if not mesh_dir.is_dir():
+            continue
+        for name in ("mesh_color.ply", "mesh_nocolor.ply"):
+            candidate = mesh_dir / name
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                print(f"[fast-pgsr] mesh -> {candidate}")
+                return candidate
 
     # Last-resort glob in case upstream renames things again.
     fallback = sorted(
@@ -131,5 +146,7 @@ def run_fast_pgsr(
         print(f"[fast-pgsr] mesh (fallback discovery) -> {fallback[0]}")
         return fallback[0]
     raise FileNotFoundError(
-        f"no mesh .ply produced under {mesh_dir} — check render.py logs"
+        f"no mesh .ply produced under {model_path} — check render.py logs. "
+        f"If you see a NameError on `mesh_path`, run "
+        f"`python scripts/patch_fastpgsr_render.py --repo {cfg.repo_path}` first."
     )

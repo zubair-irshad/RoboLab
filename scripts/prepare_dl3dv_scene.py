@@ -69,6 +69,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-camera-height-m", type=float, default=1.5)
 
     p.add_argument(
+        "--tsdf-voxel-size", type=float, default=0.02,
+        help="TSDF voxel size in metres (default 0.02 = 2cm for room-scale).",
+    )
+    p.add_argument(
+        "--tsdf-max-depth", type=float, default=6.0,
+        help="TSDF depth cutoff in metres (default 6m).",
+    )
+
+    p.add_argument(
         "--images-variant",
         choices=("images", "images_2", "images_4", "images_8"),
         default="images_4",
@@ -144,6 +153,8 @@ def main() -> int:
             repo_path=args.fastpgsr_repo,
             conda_env=args.conda_env,
             iterations=args.iterations,
+            tsdf_voxel_size=args.tsdf_voxel_size,
+            tsdf_max_depth=args.tsdf_max_depth,
         )
         mesh_path = run_fast_pgsr(
             cfg,
