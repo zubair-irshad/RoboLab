@@ -295,7 +295,7 @@ def align_scene_from_mesh(
     metric_scale_hint: float | None = None,
     target_camera_height_m: float = 1.5,
     refine_gravity: bool = True,
-    max_gravity_correction_deg: float = 15.0,
+    max_gravity_correction_deg: float = 25.0,
     floor_inlier_thresh_m: float = 0.03,
 ) -> AlignedScene:
     """Gravity-align + metric-rescale + floor-zero a reconstruction.

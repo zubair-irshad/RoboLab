@@ -68,6 +68,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--target-camera-height-m", type=float, default=1.5)
     p.add_argument(
+        "--max-gravity-correction-deg", type=float, default=25.0,
+        help="cap on how much gravity may be refined from the RANSAC floor "
+             "plane normal. Larger = more permissive; if your scene's initial "
+             "camera-up gravity is wildly wrong, bump this. If you don't trust "
+             "RANSAC enough to pivot gravity, set to 0 to disable refinement.",
+    )
+    p.add_argument(
         "--use-moge-scale",
         action="store_true",
         help="estimate metric scale via MoGe-v2 monocular depth on a few "
@@ -210,6 +217,8 @@ def main() -> int:
         mesh_path=mesh_path,
         metric_scale_hint=metric_scale_hint,
         target_camera_height_m=args.target_camera_height_m,
+        refine_gravity=(args.max_gravity_correction_deg > 0),
+        max_gravity_correction_deg=args.max_gravity_correction_deg,
     )
     print(
         f"[prepare] gravity (colmap frame) = {aligned.gravity_world_colmap.round(3).tolist()}\n"
