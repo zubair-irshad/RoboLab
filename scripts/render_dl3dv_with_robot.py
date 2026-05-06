@@ -238,13 +238,22 @@ def _build_bg_transform(
 
 
 def _set_bg_transform(stage, prim_path: str, M: np.ndarray) -> None:
+    """Author ``xformOp:transform`` on a prim from a numpy 4×4.
+
+    USD's ``GfMatrix4d`` uses row-vector / row-major convention with
+    translation in the LAST ROW (world = local · M). numpy convention is
+    column-vector with translation in the last COLUMN (world = M · local).
+    They differ by a transpose — feeding the numpy matrix directly to
+    ``Gf.Matrix4d(...)`` silently zeros out the translation. Transpose
+    on the way in.
+    """
     prim = stage.GetPrimAtPath(prim_path)
     if not prim.IsValid():
         raise RuntimeError(f"BG prim {prim_path} not on stage")
     xformable = UsdGeom.Xformable(prim)
     xformable.ClearXformOpOrder()
     op = xformable.AddTransformOp()
-    op.Set(Gf.Matrix4d(*M.flatten().tolist()))
+    op.Set(Gf.Matrix4d(*M.T.flatten().tolist()))
 
 
 def _detect_task_floor_z(

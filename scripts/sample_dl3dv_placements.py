@@ -158,6 +158,15 @@ def main() -> int:
                         "Default 0.5 m.")
     p.add_argument("--yaw", choices=("face_centroid", "random"),
                    default="face_centroid")
+    p.add_argument("--sampling", choices=("farthest_point", "random"),
+                   default="farthest_point",
+                   help="how to select N picks from the free region. "
+                        "farthest_point spreads picks across the whole free "
+                        "area; random clusters when the free region is small.")
+    p.add_argument("--min-separation", type=float, default=0.5,
+                   help="minimum xy distance (m) between sampled placements. "
+                        "Hard floor on cluster collapse — picks closer than "
+                        "this get dropped.")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -182,6 +191,8 @@ def main() -> int:
         yaw_strategy=args.yaw,
         rng_seed=args.seed,
         floor_close_radius_m=args.floor_close_radius,
+        sampling=args.sampling,
+        min_separation_m=args.min_separation,
     )
 
     out_json = scene_dir / "placements.json"

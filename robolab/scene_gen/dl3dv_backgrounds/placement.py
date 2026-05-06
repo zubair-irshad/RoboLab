@@ -218,6 +218,31 @@ def _close(mask: np.ndarray, radius_cells: int) -> np.ndarray:
         return ~_erode(~dilated, radius_cells)
 
 
+def _farthest_point_sample(
+    candidates_xy: np.ndarray, n: int, rng: np.random.Generator,
+) -> np.ndarray:
+    """Greedy farthest-point sampling. Returns indices into ``candidates_xy``.
+
+    Picks the first point at random, then iteratively the point with
+    maximum min-distance to already-selected points. Spreads samples
+    across the free region — better than uniform random when the free
+    region has multiple disconnected components or strong local clusters.
+    """
+    n = min(n, len(candidates_xy))
+    if n <= 0:
+        return np.empty(0, dtype=np.int64)
+    selected = [int(rng.integers(0, len(candidates_xy)))]
+    dists = np.linalg.norm(candidates_xy - candidates_xy[selected[0]], axis=1)
+    for _ in range(n - 1):
+        i = int(np.argmax(dists))
+        if dists[i] <= 1e-9:
+            break  # all remaining cells are duplicates of selected ones
+        selected.append(i)
+        new_d = np.linalg.norm(candidates_xy - candidates_xy[i], axis=1)
+        dists = np.minimum(dists, new_d)
+    return np.asarray(selected, dtype=np.int64)
+
+
 def sample_placements(
     *,
     aligned_mesh_path: Path,
@@ -227,6 +252,8 @@ def sample_placements(
     yaw_strategy: str = "face_centroid",
     rng_seed: int = 0,
     floor_close_radius_m: float = 0.5,
+    sampling: str = "farthest_point",
+    min_separation_m: float = 0.5,
 ) -> list[Placement]:
     """Sample ``n_placements`` valid foreground poses on the aligned floor.
 
@@ -294,11 +321,40 @@ def sample_placements(
     centroid = np.array([0.5 * (xmin + xmax), 0.5 * (ymin + ymax)])
 
     rng = np.random.default_rng(rng_seed)
-    pick = rng.choice(len(ix), size=min(n_placements, len(ix)), replace=False)
+    cell_xy = np.column_stack([
+        xmin + (ix + 0.5) * cell_size_m,
+        ymin + (iy + 0.5) * cell_size_m,
+    ])
+
+    if sampling == "farthest_point":
+        pick = _farthest_point_sample(cell_xy, n_placements, rng)
+    elif sampling == "random":
+        pick = rng.choice(len(ix), size=min(n_placements, len(ix)), replace=False)
+    else:
+        raise ValueError(f"unknown sampling strategy {sampling!r}")
+
+    # Optional min-separation pruning: enforce that picks are at least
+    # min_separation_m apart in xy. FPS already maximizes spread, but a
+    # hard floor stops two picks from collapsing onto a 5cm cluster when
+    # the free region is degenerate.
+    if min_separation_m > 0:
+        kept: list[int] = []
+        for idx in pick:
+            p = cell_xy[idx]
+            if all(np.linalg.norm(p - cell_xy[k]) >= min_separation_m for k in kept):
+                kept.append(int(idx))
+        pick = np.asarray(kept, dtype=np.int64)
+        if len(pick) < min(n_placements, len(cell_xy)):
+            print(
+                f"[placement] only {len(pick)} placements satisfy "
+                f"min_separation={min_separation_m} m (requested {n_placements}); "
+                f"the free region is small or fragmented"
+            )
+
     placements: list[Placement] = []
     for k in pick:
-        x = xmin + (ix[k] + 0.5) * cell_size_m
-        y = ymin + (iy[k] + 0.5) * cell_size_m
+        x = float(cell_xy[k, 0])
+        y = float(cell_xy[k, 1])
         if yaw_strategy == "random":
             yaw = float(rng.uniform(-np.pi, np.pi))
         elif yaw_strategy == "face_centroid":
