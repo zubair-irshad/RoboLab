@@ -32,27 +32,42 @@ from .align import _ransac_floor_plane
 class FootprintSpec:
     """3D volume the task occupies, before yaw rotation.
 
-    The robot's actual working volume is a column above the placement:
-    table footprint (length × width) at the base, sweeping up to the
-    full reach of the arm. Both clearance_m (vertical extent) and
-    robot_reach_m (lateral margin around the footprint for the arm)
-    matter for whether a placement is collision-free.
+    Obstacles get checked in TWO height bands separately:
+
+      - Below ``table_height_m``: must clear the footprint half-diag
+        (the task's own table can't overlap furniture down here).
+      - Between ``table_height_m`` and ``clearance_m``: must clear the
+        footprint half-diag PLUS ``robot_reach_m`` (the arm sweeps
+        laterally up here).
+
+    A sofa (low) within reach of the robot is fine — the arm goes over.
+    A wall or tall bookcase within reach is not — the arm hits it.
     """
-    length_m: float = 1.5   # along +X (task footprint at floor level)
-    width_m: float = 1.0    # along +Y
-    clearance_m: float = 2.5  # vertical reach of the robot column
-    robot_reach_m: float = 0.85  # lateral arm reach beyond the footprint edge
+    length_m: float = 1.5
+    width_m: float = 1.0
+    clearance_m: float = 2.5         # top of robot working volume
+    robot_reach_m: float = 0.85      # lateral reach beyond footprint edge
+    table_height_m: float = 0.75     # split between low / high obstacle bands
 
     @property
-    def erosion_radius_m(self) -> float:
-        """Conservative outer radius for free-space erosion.
+    def half_diag_m(self) -> float:
+        return 0.5 * float(np.hypot(self.length_m, self.width_m))
 
-        ``half_diag`` covers any rotation of the rectangle; adding
-        ``robot_reach`` keeps the arm's swept lateral volume clear of
-        obstacles regardless of yaw.
-        """
-        half_diag = 0.5 * float(np.hypot(self.length_m, self.width_m))
-        return half_diag + max(0.0, self.robot_reach_m)
+    @property
+    def low_erosion_radius_m(self) -> float:
+        """Below table top: only the table footprint matters."""
+        return self.half_diag_m
+
+    @property
+    def high_erosion_radius_m(self) -> float:
+        """Above table top: footprint + arm reach (any yaw)."""
+        return self.half_diag_m + max(0.0, self.robot_reach_m)
+
+    # Backward-compat alias used by older callers; equivalent to
+    # ``high_erosion_radius_m`` (the more conservative of the two).
+    @property
+    def erosion_radius_m(self) -> float:
+        return self.high_erosion_radius_m
 
 
 @dataclass
@@ -84,24 +99,26 @@ def _build_topdown_grids(
     cell_size_m: float = 0.05,
     clearance_m: float = 2.5,
     floor_band_m: float = 0.05,
-) -> tuple[np.ndarray, np.ndarray, tuple[float, float, float, float]]:
-    """Return ``(obstacle, has_floor, (xmin, ymin, xmax, ymax))`` grids.
+    table_height_m: float = 0.75,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[float, float, float, float]]:
+    """Return ``(low_obs, high_obs, has_floor, (xmin, ymin, xmax, ymax))``.
 
-    ``obstacle[H, W]``: True if any vertex with z ∈ (floor_band, clearance)
-    projects into the cell. Walls, furniture, hanging fixtures, etc.
+    Obstacles split into two height bands so the caller can apply
+    different erosion radii:
 
-    ``has_floor[H, W]``: True if any RANSAC-inlier floor vertex (i.e.
-    actual captured floor) projects into the cell. Critically,
-    ``has_floor=False`` outside the room — DL3DV captures stop at room
-    boundaries, so anywhere the operator didn't aim at the floor has no
-    floor evidence and isn't a valid placement (the simulator floor would
-    be physically there, but visually there's nothing — the DL3DV mesh
-    has no walls, ceiling, or floor in that region).
+      ``low_obs`` — vertices in (floor_band, table_height). Furniture
+      that the task table cannot overlap (sofas, coffee tables).
 
-    A cell is a valid placement iff ``has_floor AND NOT obstacle`` after
-    the appropriate erosion in the caller.
+      ``high_obs`` — vertices in (table_height, clearance). Things that
+      block the robot's swung arm (walls, tall bookcases, hanging
+      fixtures). Most low furniture doesn't reach this band, so a
+      placement next to a sofa stays valid as long as the airspace
+      above the sofa is clear.
 
-    TSDF "shadow" floaters at z < -0.1 are ignored on both sides.
+      ``has_floor`` — RANSAC-inlier floor vertices. Required so we
+      don't sample placements outside the captured room boundary.
+
+    TSDF "shadow" floaters at z < -0.1 are filtered everywhere.
     """
     try:
         import trimesh
@@ -118,23 +135,21 @@ def _build_topdown_grids(
     verts = np.asarray(mesh.vertices, dtype=np.float64)
     z = verts[:, 2]
 
-    # Re-derive the floor mask (RANSAC) on the aligned mesh. The floor
-    # should be at z≈0, but in case the alignment quality is imperfect,
-    # we recompute.
     _, _, floor_mask = _ransac_floor_plane(verts, return_mask=True)
 
-    obstacle_keep = (z > floor_band_m) & (z < clearance_m) & (z > -0.1)
-    obstacle_pts = verts[obstacle_keep, :2]
+    valid_height = (z > floor_band_m) & (z < clearance_m) & (z > -0.1)
+    is_low = valid_height & (z <= table_height_m)
+    is_high = valid_height & (z > table_height_m)
+
+    low_pts = verts[is_low, :2]
+    high_pts = verts[is_high, :2]
     floor_pts = verts[floor_mask, :2]
 
-    if len(obstacle_pts) == 0 and len(floor_pts) == 0:
+    if len(low_pts) == 0 and len(high_pts) == 0 and len(floor_pts) == 0:
         raise RuntimeError("no usable vertices found — mesh empty or alignment broken?")
 
-    # Build a common bbox covering both — that way any cell can be looked
-    # up in either grid with the same indexing.
-    all_pts = np.concatenate([obstacle_pts, floor_pts]) if (
-        len(obstacle_pts) and len(floor_pts)
-    ) else (obstacle_pts if len(obstacle_pts) else floor_pts)
+    pieces = [a for a in (low_pts, high_pts, floor_pts) if len(a) > 0]
+    all_pts = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
     xmin, ymin = all_pts.min(axis=0)
     xmax, ymax = all_pts.max(axis=0)
     xmin, ymin = float(xmin) - 1.0, float(ymin) - 1.0
@@ -152,15 +167,16 @@ def _build_topdown_grids(
         grid[iy, ix] = True
         return grid
 
-    obstacle = _rasterize(obstacle_pts)
+    low_obs = _rasterize(low_pts)
+    high_obs = _rasterize(high_pts)
     has_floor = _rasterize(floor_pts)
-    return obstacle, has_floor, (xmin, ymin, xmax, ymax)
+    return low_obs, high_obs, has_floor, (xmin, ymin, xmax, ymax)
 
 
 # Backward-compat alias kept for any callers that imported the old name.
 def _build_topdown_occupancy(*args, **kwargs):
-    obs, _, bbox = _build_topdown_grids(*args, **kwargs)
-    return obs, bbox
+    low, high, _, bbox = _build_topdown_grids(*args, **kwargs)
+    return (low | high), bbox
 
 
 def _erode(occupancy: np.ndarray, radius_cells: int) -> np.ndarray:
@@ -229,52 +245,50 @@ def sample_placements(
     if footprint is None:
         footprint = FootprintSpec()
 
-    obstacle, has_floor, (xmin, ymin, xmax, ymax) = _build_topdown_grids(
+    low_obs, high_obs, has_floor, (xmin, ymin, xmax, ymax) = _build_topdown_grids(
         aligned_mesh_path,
         cell_size_m=cell_size_m,
         clearance_m=footprint.clearance_m,
+        table_height_m=footprint.table_height_m,
     )
 
-    # Floor inliers are sparse — RANSAC only labels pixels it has
-    # triangulated mesh evidence for, and furniture occludes large
-    # patches of the actual floor during capture. Close the mask first
-    # to bridge those gaps. The closing radius should exceed typical
-    # furniture extent (~0.5 m) so a coffee-table-shaped hole gets
-    # filled. Closing won't extend the floor outside the original
-    # convex hull, so this stays inside the room.
+    # Close the floor mask first to bridge gaps caused by furniture
+    # occluding floor capture. Doesn't extend the floor outside its
+    # original convex hull.
     close_cells = int(np.ceil(floor_close_radius_m / cell_size_m))
     has_floor_closed = _close(has_floor, close_cells)
 
-    # Two erosions:
-    #   - obstacles dilate by the full erosion radius so any rotation of
-    #     the footprint + robot reach stays clear of furniture/walls.
-    #   - floor coverage erodes (== free space dilates) so we only sample
-    #     from cells where the FULL footprint sits over (closed) floor.
-    #     The half-diagonal is enough here — the robot reach can extend
-    #     over a sofa visually as long as the footprint is on floor.
-    erode_cells_obs = int(np.ceil(footprint.erosion_radius_m / cell_size_m))
-    half_diag = 0.5 * float(np.hypot(footprint.length_m, footprint.width_m))
-    erode_cells_floor = int(np.ceil(half_diag / cell_size_m))
+    # Three independent erosions, AND'd together:
+    #   - low obstacles dilate by half_diag (table-only clearance)
+    #   - high obstacles dilate by half_diag + reach (arm sweep)
+    #   - floor coverage erodes by half_diag (footprint over captured floor)
+    erode_low = int(np.ceil(footprint.low_erosion_radius_m / cell_size_m))
+    erode_high = int(np.ceil(footprint.high_erosion_radius_m / cell_size_m))
+    erode_floor = int(np.ceil(footprint.half_diag_m / cell_size_m))
 
-    obstacle_eroded = _erode(obstacle, erode_cells_obs)
-    floor_eroded = ~_erode(~has_floor_closed, erode_cells_floor)
+    low_eroded = _erode(low_obs, erode_low)
+    high_eroded = _erode(high_obs, erode_high)
+    floor_eroded = ~_erode(~has_floor_closed, erode_floor)
 
-    free = floor_eroded & (~obstacle_eroded)
+    free = floor_eroded & (~low_eroded) & (~high_eroded)
 
     iy, ix = np.where(free)
     if len(ix) == 0:
-        n_floor = int(has_floor.sum())
-        n_closed = int(has_floor_closed.sum())
-        n_floor_eroded = int(floor_eroded.sum())
-        n_free_no_floor_check = int((~obstacle_eroded).sum())
         raise RuntimeError(
-            f"no valid placement cells. has_floor: {n_floor} (closed: "
-            f"{n_closed}) → eroded {n_floor_eroded}; obstacle-eroded "
-            f"free: {n_free_no_floor_check}; intersection: 0. "
-            f"Try (a) increasing --floor-close-radius if floor coverage "
-            f"is fragmented, (b) shrinking --footprint-* / --robot-reach, "
-            f"or (c) checking that the room is actually big enough for "
-            f"the task."
+            f"no valid placement cells. Diagnostics:\n"
+            f"  has_floor (raw):      {int(has_floor.sum()):8d} cells\n"
+            f"  has_floor (closed):   {int(has_floor_closed.sum()):8d} cells\n"
+            f"  floor footprint-fit:  {int(floor_eroded.sum()):8d} cells\n"
+            f"  low-obstacle free:    {int((~low_eroded).sum()):8d} cells\n"
+            f"  high-obstacle free:   {int((~high_eroded).sum()):8d} cells\n"
+            f"  intersection:                0 cells\n"
+            f"Most common causes:\n"
+            f"  - Footprint+reach larger than the room: shrink --footprint-* "
+            f"or --robot-reach.\n"
+            f"  - Floor mask too sparse: increase --floor-close-radius "
+            f"(default 0.5 m, try 1.0 or 1.5).\n"
+            f"  - High-obstacle band picks up walls everywhere: lower "
+            f"--clearance (default 2.5 m, try 1.5)."
         )
 
     centroid = np.array([0.5 * (xmin + xmax), 0.5 * (ymin + ymax)])

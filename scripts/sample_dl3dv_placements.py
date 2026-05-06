@@ -144,6 +144,11 @@ def main() -> int:
                         "margin when sampling. Default 0.85 (Franka).")
     p.add_argument("--cell-size", type=float, default=0.05,
                    help="occupancy grid cell size (metres)")
+    p.add_argument("--table-height", type=float, default=0.75,
+                   help="height (m) at which obstacle bands split. Below = "
+                        "must clear footprint only; above = must clear "
+                        "footprint + reach. Lets the arm sweep over sofas "
+                        "while still avoiding walls.")
     p.add_argument("--floor-close-radius", type=float, default=0.5,
                    help="morphological closing radius (m) applied to the "
                         "RANSAC floor mask. RANSAC only labels pixels with "
@@ -167,6 +172,7 @@ def main() -> int:
         width_m=args.footprint_wid,
         clearance_m=args.clearance,
         robot_reach_m=args.robot_reach,
+        table_height_m=args.table_height,
     )
     placements = sample_placements(
         aligned_mesh_path=aligned_mesh,
