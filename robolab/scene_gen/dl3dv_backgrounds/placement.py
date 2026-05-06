@@ -78,27 +78,37 @@ class Placement:
         return (local @ R.T) + np.array([self.x_m, self.y_m])
 
 
-def _build_topdown_occupancy(
+def _build_topdown_grids(
     aligned_mesh_path: Path,
     *,
     cell_size_m: float = 0.05,
-    clearance_m: float = 1.5,
+    clearance_m: float = 2.5,
     floor_band_m: float = 0.05,
-) -> tuple[np.ndarray, tuple[float, float, float, float]]:
-    """Return ``(occupied[H, W], (xmin, ymin, xmax, ymax))``.
+) -> tuple[np.ndarray, np.ndarray, tuple[float, float, float, float]]:
+    """Return ``(obstacle, has_floor, (xmin, ymin, xmax, ymax))`` grids.
 
-    A cell is occupied if any vertex with z in ``(floor_band, clearance)``
-    projects into it. Vertices on the floor (z<=floor_band) and vertices
-    above the clearance ceiling are ignored — we don't care about the
-    ceiling and we want the floor itself to be free.
+    ``obstacle[H, W]``: True if any vertex with z ∈ (floor_band, clearance)
+    projects into the cell. Walls, furniture, hanging fixtures, etc.
 
-    Note: because the aligned mesh has TSDF "shadow" floaters below z=0,
-    we also exclude any vertex with z < -0.1 m (those are clearly noise).
+    ``has_floor[H, W]``: True if any RANSAC-inlier floor vertex (i.e.
+    actual captured floor) projects into the cell. Critically,
+    ``has_floor=False`` outside the room — DL3DV captures stop at room
+    boundaries, so anywhere the operator didn't aim at the floor has no
+    floor evidence and isn't a valid placement (the simulator floor would
+    be physically there, but visually there's nothing — the DL3DV mesh
+    has no walls, ceiling, or floor in that region).
+
+    A cell is a valid placement iff ``has_floor AND NOT obstacle`` after
+    the appropriate erosion in the caller.
+
+    TSDF "shadow" floaters at z < -0.1 are ignored on both sides.
     """
     try:
         import trimesh
     except ImportError as e:  # pragma: no cover
         raise ImportError("trimesh required; `pip install trimesh`") from e
+    from .align import _ransac_floor_plane
+
     mesh = trimesh.load(str(aligned_mesh_path), process=False)
     if hasattr(mesh, "dump"):
         try:
@@ -106,29 +116,51 @@ def _build_topdown_occupancy(
         except Exception:
             pass
     verts = np.asarray(mesh.vertices, dtype=np.float64)
-
     z = verts[:, 2]
-    keep = (z > floor_band_m) & (z < clearance_m) & (z > -0.1)
-    pts = verts[keep, :2]
-    if len(pts) == 0:
-        raise RuntimeError(
-            f"no vertices in clearance band ({floor_band_m}, {clearance_m}) m — "
-            f"mesh empty or alignment broken?"
-        )
 
-    xmin, ymin = pts.min(axis=0)
-    xmax, ymax = pts.max(axis=0)
-    # Pad bbox by 1 m so the erosion has somewhere to retreat to.
-    xmin, ymin = xmin - 1.0, ymin - 1.0
-    xmax, ymax = xmax + 1.0, ymax + 1.0
+    # Re-derive the floor mask (RANSAC) on the aligned mesh. The floor
+    # should be at z≈0, but in case the alignment quality is imperfect,
+    # we recompute.
+    _, _, floor_mask = _ransac_floor_plane(verts, return_mask=True)
+
+    obstacle_keep = (z > floor_band_m) & (z < clearance_m) & (z > -0.1)
+    obstacle_pts = verts[obstacle_keep, :2]
+    floor_pts = verts[floor_mask, :2]
+
+    if len(obstacle_pts) == 0 and len(floor_pts) == 0:
+        raise RuntimeError("no usable vertices found — mesh empty or alignment broken?")
+
+    # Build a common bbox covering both — that way any cell can be looked
+    # up in either grid with the same indexing.
+    all_pts = np.concatenate([obstacle_pts, floor_pts]) if (
+        len(obstacle_pts) and len(floor_pts)
+    ) else (obstacle_pts if len(obstacle_pts) else floor_pts)
+    xmin, ymin = all_pts.min(axis=0)
+    xmax, ymax = all_pts.max(axis=0)
+    xmin, ymin = float(xmin) - 1.0, float(ymin) - 1.0
+    xmax, ymax = float(xmax) + 1.0, float(ymax) + 1.0
 
     W = int(np.ceil((xmax - xmin) / cell_size_m))
     H = int(np.ceil((ymax - ymin) / cell_size_m))
-    occ = np.zeros((H, W), dtype=bool)
-    ix = np.clip(((pts[:, 0] - xmin) / cell_size_m).astype(int), 0, W - 1)
-    iy = np.clip(((pts[:, 1] - ymin) / cell_size_m).astype(int), 0, H - 1)
-    occ[iy, ix] = True
-    return occ, (float(xmin), float(ymin), float(xmax), float(ymax))
+
+    def _rasterize(points: np.ndarray) -> np.ndarray:
+        grid = np.zeros((H, W), dtype=bool)
+        if len(points) == 0:
+            return grid
+        ix = np.clip(((points[:, 0] - xmin) / cell_size_m).astype(int), 0, W - 1)
+        iy = np.clip(((points[:, 1] - ymin) / cell_size_m).astype(int), 0, H - 1)
+        grid[iy, ix] = True
+        return grid
+
+    obstacle = _rasterize(obstacle_pts)
+    has_floor = _rasterize(floor_pts)
+    return obstacle, has_floor, (xmin, ymin, xmax, ymax)
+
+
+# Backward-compat alias kept for any callers that imported the old name.
+def _build_topdown_occupancy(*args, **kwargs):
+    obs, _, bbox = _build_topdown_grids(*args, **kwargs)
+    return obs, bbox
 
 
 def _erode(occupancy: np.ndarray, radius_cells: int) -> np.ndarray:
@@ -176,28 +208,42 @@ def sample_placements(
     if footprint is None:
         footprint = FootprintSpec()
 
-    occ, (xmin, ymin, xmax, ymax) = _build_topdown_occupancy(
+    obstacle, has_floor, (xmin, ymin, xmax, ymax) = _build_topdown_grids(
         aligned_mesh_path,
         cell_size_m=cell_size_m,
         clearance_m=footprint.clearance_m,
     )
 
-    # Erode by an outer-radius that covers both rotation of the rectangle
-    # AND the robot's lateral reach beyond the footprint edge. This is
-    # conservative (a Minkowski sum approximation), but cheap and ensures
-    # the robot can sweep its working volume without hitting walls or
-    # furniture regardless of yaw.
-    erode_cells = int(np.ceil(footprint.erosion_radius_m / cell_size_m))
-    occ_eroded = _erode(occ, erode_cells)
-    free = ~occ_eroded
+    # Two erosions:
+    #   - obstacles dilate by the full erosion radius so any rotation of
+    #     the footprint + robot reach stays clear of furniture/walls.
+    #   - floor coverage erodes (== free space dilates) so we only sample
+    #     from cells where the FULL footprint sits over captured floor.
+    #     The half-diagonal is enough here — we don't need the robot's
+    #     reach to be over floor (it can extend over a sofa visually).
+    erode_cells_obs = int(np.ceil(footprint.erosion_radius_m / cell_size_m))
+    half_diag = 0.5 * float(np.hypot(footprint.length_m, footprint.width_m))
+    erode_cells_floor = int(np.ceil(half_diag / cell_size_m))
 
-    # Free cells, converted back to world-xy.
+    obstacle_eroded = _erode(obstacle, erode_cells_obs)
+    # Floor erosion: we want cells where every pixel within half-diag is
+    # ALSO has_floor. Equivalent: free_floor = NOT _erode(NOT has_floor).
+    floor_eroded = ~_erode(~has_floor, erode_cells_floor)
+
+    free = floor_eroded & (~obstacle_eroded)
+
     iy, ix = np.where(free)
     if len(ix) == 0:
+        n_floor = int(has_floor.sum())
+        n_floor_eroded = int(floor_eroded.sum())
+        n_free_no_floor_check = int((~obstacle_eroded).sum())
         raise RuntimeError(
-            f"no free cells after erosion (footprint half-diag = "
-            f"{footprint.half_diag_m:.2f} m); scene may be too cluttered "
-            f"or footprint too large"
+            f"no valid placement cells. has_floor: {n_floor} → eroded "
+            f"{n_floor_eroded}; obstacle-eroded free: "
+            f"{n_free_no_floor_check}; intersection: 0. "
+            f"Footprint may be too large for the captured floor area, or "
+            f"the floor mask is too sparse — try smaller --footprint-* or "
+            f"a less aggressive --robot-reach."
         )
 
     centroid = np.array([0.5 * (xmin + xmax), 0.5 * (ymin + ymax)])

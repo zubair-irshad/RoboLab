@@ -66,13 +66,26 @@ def _render(
     import matplotlib.pyplot as plt
     from matplotlib.patches import Circle, Polygon
 
-    # Top-down: drop z. Subsample for plotting speed.
+    from robolab.scene_gen.dl3dv_backgrounds.align import _ransac_floor_plane
+
+    # Floor inliers (where actual captured floor lives) — show in green
+    # so you can see at a glance whether placements land *inside* the
+    # captured room or outside it.
+    _, _, floor_mask = _ransac_floor_plane(verts, return_mask=True)
+    floor_pts = verts[floor_mask][:, :2]
+    if len(floor_pts) > 100_000:
+        idx = np.random.default_rng(0).choice(len(floor_pts), 100_000, replace=False)
+        floor_pts = floor_pts[idx]
+
+    # Non-floor obstacles — gray
     pts = verts[(verts[:, 2] > 0.05) & (verts[:, 2] < 2.5)][:, :2]
     if len(pts) > 200_000:
         idx = np.random.default_rng(0).choice(len(pts), 200_000, replace=False)
         pts = pts[idx]
 
     fig, ax = plt.subplots(figsize=(10, 10))
+    ax.scatter(floor_pts[:, 0], floor_pts[:, 1], s=0.3, c="#3cb371",
+               alpha=0.4, label="captured floor (RANSAC)")
     ax.scatter(pts[:, 0], pts[:, 1], s=0.3, c="#444", alpha=0.5, label="non-floor mesh")
     ax.scatter(cam_centers[:, 0], cam_centers[:, 1],
                s=12, c="#d62728", alpha=0.8, label="cameras")
