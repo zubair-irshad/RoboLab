@@ -16,6 +16,8 @@ in sibling modules added later.
 from .download import DL3DVSceneRef, download_scene
 from .reconstruct import FastPgsrConfig, run_fast_pgsr
 from .align import AlignedScene, align_scene_from_mesh
+# Note: metric_scale_moge has heavy optional deps (torch + MoGe). Import
+# lazily — don't pull it into the package's eager import path.
 
 __all__ = [
     "DL3DVSceneRef",

@@ -64,9 +64,25 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="multiplier from COLMAP units to metres; if omitted, derived "
-             "from camera-height heuristic (median cam = 1.5 m)",
+             "from MoGe (if --use-moge-scale) or the camera-height heuristic.",
     )
     p.add_argument("--target-camera-height-m", type=float, default=1.5)
+    p.add_argument(
+        "--use-moge-scale",
+        action="store_true",
+        help="estimate metric scale via MoGe-v2 monocular depth on a few "
+             "sampled frames + COLMAP 2D-3D correspondences. Strictly more "
+             "accurate than the camera-height heuristic but requires MoGe + "
+             "GPU. Install: `pip install git+https://github.com/microsoft/MoGe.git`",
+    )
+    p.add_argument(
+        "--moge-num-frames", type=int, default=5,
+        help="number of evenly-spaced frames to run MoGe on.",
+    )
+    p.add_argument(
+        "--moge-device", default="cuda",
+        help="torch device for MoGe inference.",
+    )
 
     p.add_argument(
         "--tsdf-voxel-size", type=float, default=0.02,
@@ -168,10 +184,29 @@ def main() -> int:
         print(f"[prepare] skipping alignment; mesh at {mesh_path}")
         return 0
 
+    metric_scale_hint = args.metric_scale_hint
+    moge_result = None
+    if args.use_moge_scale and metric_scale_hint is None:
+        from robolab.scene_gen.dl3dv_backgrounds.metric_scale_moge import (
+            estimate_metric_scale_via_moge,
+        )
+        moge_result = estimate_metric_scale_via_moge(
+            colmap_source_path=scene.colmap_source_path,
+            num_frames=args.moge_num_frames,
+            device=args.moge_device,
+        )
+        metric_scale_hint = moge_result.scale
+        print(
+            f"[prepare] using MoGe-derived metric scale: "
+            f"{metric_scale_hint:.4f} m/unit "
+            f"(from {moge_result.num_correspondences} correspondences "
+            f"across {moge_result.num_frames_used} frames)"
+        )
+
     aligned = align_scene_from_mesh(
         colmap_source_path=scene.colmap_source_path,
         mesh_path=mesh_path,
-        metric_scale_hint=args.metric_scale_hint,
+        metric_scale_hint=metric_scale_hint,
         target_camera_height_m=args.target_camera_height_m,
     )
     print(
@@ -204,6 +239,20 @@ def main() -> int:
         "floor_quality_score": aligned.quality_score,
         "metric_scale_hint": args.metric_scale_hint,
         "target_camera_height_m": args.target_camera_height_m,
+        "scale_source": (
+            "user" if args.metric_scale_hint is not None
+            else "moge" if moge_result is not None
+            else "camera_height_heuristic"
+        ),
+        "moge_result": (
+            None if moge_result is None
+            else {
+                "scale": moge_result.scale,
+                "per_frame_scales": moge_result.per_frame_scales,
+                "num_correspondences": moge_result.num_correspondences,
+                "num_frames_used": moge_result.num_frames_used,
+            }
+        ),
     }
     meta_path = out_root / "metadata.json"
     meta_path.write_text(json.dumps(metadata, indent=2))
