@@ -243,9 +243,7 @@ def _set_bg_transform(stage, prim_path: str, M: np.ndarray) -> None:
     USD's ``GfMatrix4d`` uses row-vector / row-major convention with
     translation in the LAST ROW (world = local · M). numpy convention is
     column-vector with translation in the last COLUMN (world = M · local).
-    They differ by a transpose — feeding the numpy matrix directly to
-    ``Gf.Matrix4d(...)`` silently zeros out the translation. Transpose
-    on the way in.
+    They differ by a transpose.
     """
     prim = stage.GetPrimAtPath(prim_path)
     if not prim.IsValid():
@@ -254,6 +252,26 @@ def _set_bg_transform(stage, prim_path: str, M: np.ndarray) -> None:
     xformable.ClearXformOpOrder()
     op = xformable.AddTransformOp()
     op.Set(Gf.Matrix4d(*M.T.flatten().tolist()))
+
+
+def _verify_bg_transform(stage, prim_path: str, expected_M: np.ndarray) -> None:
+    """Read back the prim's local transform and compare to what we authored."""
+    from pxr import UsdGeom
+    prim = stage.GetPrimAtPath(prim_path)
+    xformable = UsdGeom.Xformable(prim)
+    actual = xformable.GetLocalTransformation()
+    actual_np = np.array([[actual[i][j] for j in range(4)] for i in range(4)])
+    # USD row-major → transpose to compare with our column-vector numpy form
+    actual_np = actual_np.T
+    if np.allclose(actual_np, expected_M, atol=1e-5):
+        print(f"[render] BG xformOp verified: matrix landed on {prim_path}")
+    else:
+        diff = np.abs(actual_np - expected_M).max()
+        print(
+            f"[render] BG xformOp MISMATCH on {prim_path} (max abs diff = {diff:.4f}). "
+            f"Expected translation = {expected_M[:3, 3].round(3).tolist()}, "
+            f"actual translation = {actual_np[:3, 3].round(3).tolist()}"
+        )
 
 
 def _detect_task_floor_z(
@@ -382,11 +400,25 @@ def main() -> int:
     M = _build_bg_transform(
         pl["x_m"], pl["y_m"], pl["yaw_rad"], z_offset=bg_z_offset,
     )
+    print(f"[render] computed BG transform M (numpy convention):")
+    for row in M:
+        print(f"           [{row[0]: 8.4f} {row[1]: 8.4f} {row[2]: 8.4f} {row[3]: 8.4f}]")
     _set_bg_transform(runtime.stage, bg_prim_path, M)
+    _verify_bg_transform(runtime.stage, bg_prim_path, M)
     print(
         f"[render] BG transformed: placement_xy → world origin, "
         f"yaw zeroed, z_offset = {bg_z_offset:+.3f} m"
     )
+
+    # Also print the BG prim's COLLIDER sibling's transform — same matrix
+    # should apply to it. If the collider has its own (uncoupled) transform,
+    # depth and visual won't agree. set_background_scene uses
+    # /World/MarbleBackgroundCollider for the collider.
+    collider_path = "/World/MarbleBackgroundCollider"
+    if runtime.stage.GetPrimAtPath(collider_path).IsValid():
+        _set_bg_transform(runtime.stage, collider_path, M)
+        _verify_bg_transform(runtime.stage, collider_path, M)
+        print(f"[render] applied same BG transform to collider {collider_path}")
 
     if args_cli.use_path_tracing:
         runtime.set_path_tracing(True, spp=args_cli.spp)
