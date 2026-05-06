@@ -182,6 +182,26 @@ def _erode(occupancy: np.ndarray, radius_cells: int) -> np.ndarray:
         return windowed.any(axis=(-1, -2))
 
 
+def _close(mask: np.ndarray, radius_cells: int) -> np.ndarray:
+    """Morphological closing: fill holes / bridge gaps up to ``radius_cells``.
+
+    Closing = dilate then erode with the same kernel. Connects fragments
+    of a sparse mask (e.g. RANSAC floor inliers occluded by furniture)
+    without extending the overall extent — outside the original mask's
+    convex hull, dilate-then-erode is a no-op.
+    """
+    if radius_cells <= 0:
+        return mask.copy()
+    try:
+        from scipy.ndimage import binary_closing
+        struct = np.ones((2 * radius_cells + 1, 2 * radius_cells + 1), dtype=bool)
+        return binary_closing(mask, structure=struct)
+    except ImportError:
+        # Compose dilate(erode^c)^c via _erode.
+        dilated = _erode(mask, radius_cells)
+        return ~_erode(~dilated, radius_cells)
+
+
 def sample_placements(
     *,
     aligned_mesh_path: Path,
@@ -190,6 +210,7 @@ def sample_placements(
     cell_size_m: float = 0.05,
     yaw_strategy: str = "face_centroid",
     rng_seed: int = 0,
+    floor_close_radius_m: float = 0.5,
 ) -> list[Placement]:
     """Sample ``n_placements`` valid foreground poses on the aligned floor.
 
@@ -214,36 +235,46 @@ def sample_placements(
         clearance_m=footprint.clearance_m,
     )
 
+    # Floor inliers are sparse — RANSAC only labels pixels it has
+    # triangulated mesh evidence for, and furniture occludes large
+    # patches of the actual floor during capture. Close the mask first
+    # to bridge those gaps. The closing radius should exceed typical
+    # furniture extent (~0.5 m) so a coffee-table-shaped hole gets
+    # filled. Closing won't extend the floor outside the original
+    # convex hull, so this stays inside the room.
+    close_cells = int(np.ceil(floor_close_radius_m / cell_size_m))
+    has_floor_closed = _close(has_floor, close_cells)
+
     # Two erosions:
     #   - obstacles dilate by the full erosion radius so any rotation of
     #     the footprint + robot reach stays clear of furniture/walls.
     #   - floor coverage erodes (== free space dilates) so we only sample
-    #     from cells where the FULL footprint sits over captured floor.
-    #     The half-diagonal is enough here — we don't need the robot's
-    #     reach to be over floor (it can extend over a sofa visually).
+    #     from cells where the FULL footprint sits over (closed) floor.
+    #     The half-diagonal is enough here — the robot reach can extend
+    #     over a sofa visually as long as the footprint is on floor.
     erode_cells_obs = int(np.ceil(footprint.erosion_radius_m / cell_size_m))
     half_diag = 0.5 * float(np.hypot(footprint.length_m, footprint.width_m))
     erode_cells_floor = int(np.ceil(half_diag / cell_size_m))
 
     obstacle_eroded = _erode(obstacle, erode_cells_obs)
-    # Floor erosion: we want cells where every pixel within half-diag is
-    # ALSO has_floor. Equivalent: free_floor = NOT _erode(NOT has_floor).
-    floor_eroded = ~_erode(~has_floor, erode_cells_floor)
+    floor_eroded = ~_erode(~has_floor_closed, erode_cells_floor)
 
     free = floor_eroded & (~obstacle_eroded)
 
     iy, ix = np.where(free)
     if len(ix) == 0:
         n_floor = int(has_floor.sum())
+        n_closed = int(has_floor_closed.sum())
         n_floor_eroded = int(floor_eroded.sum())
         n_free_no_floor_check = int((~obstacle_eroded).sum())
         raise RuntimeError(
-            f"no valid placement cells. has_floor: {n_floor} → eroded "
-            f"{n_floor_eroded}; obstacle-eroded free: "
-            f"{n_free_no_floor_check}; intersection: 0. "
-            f"Footprint may be too large for the captured floor area, or "
-            f"the floor mask is too sparse — try smaller --footprint-* or "
-            f"a less aggressive --robot-reach."
+            f"no valid placement cells. has_floor: {n_floor} (closed: "
+            f"{n_closed}) → eroded {n_floor_eroded}; obstacle-eroded "
+            f"free: {n_free_no_floor_check}; intersection: 0. "
+            f"Try (a) increasing --floor-close-radius if floor coverage "
+            f"is fragmented, (b) shrinking --footprint-* / --robot-reach, "
+            f"or (c) checking that the room is actually big enough for "
+            f"the task."
         )
 
     centroid = np.array([0.5 * (xmin + xmax), 0.5 * (ymin + ymax)])

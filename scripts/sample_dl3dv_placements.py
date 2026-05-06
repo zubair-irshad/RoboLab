@@ -144,6 +144,13 @@ def main() -> int:
                         "margin when sampling. Default 0.85 (Franka).")
     p.add_argument("--cell-size", type=float, default=0.05,
                    help="occupancy grid cell size (metres)")
+    p.add_argument("--floor-close-radius", type=float, default=0.5,
+                   help="morphological closing radius (m) applied to the "
+                        "RANSAC floor mask. RANSAC only labels pixels with "
+                        "triangulated floor evidence; furniture occludes "
+                        "large gaps in this. Closing fills holes up to this "
+                        "radius, restoring the floor under sofas etc. "
+                        "Default 0.5 m.")
     p.add_argument("--yaw", choices=("face_centroid", "random"),
                    default="face_centroid")
     p.add_argument("--seed", type=int, default=0)
@@ -168,6 +175,7 @@ def main() -> int:
         cell_size_m=args.cell_size,
         yaw_strategy=args.yaw,
         rng_seed=args.seed,
+        floor_close_radius_m=args.floor_close_radius,
     )
 
     out_json = scene_dir / "placements.json"
