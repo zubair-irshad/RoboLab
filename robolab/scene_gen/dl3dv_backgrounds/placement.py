@@ -309,6 +309,7 @@ def sample_placements(
     max_camera_distance_m: float | None = None,
     camera_floor_radius_m: float = 1.5,
     min_floor_area_m2: float = 3.0,
+    min_free_area_m2: float = 1.0,
 ) -> list[Placement]:
     """Sample ``n_placements`` valid foreground poses on the aligned floor.
 
@@ -395,6 +396,26 @@ def sample_placements(
     floor_eroded = ~_erode(~has_floor_closed, erode_floor)
 
     free = floor_eroded & (~low_eroded) & (~high_eroded)
+
+    # Drop tiny components in the FINAL free mask. This catches the
+    # "peninsula" failure mode: a doorway / open passage between rooms
+    # is connected to the main floor (so it survives the floor-mask
+    # component filter), but the eroded `free` cells in that passage
+    # form only a thin strip (~0.5 m² total) — much smaller than the
+    # main room's free area. Without this filter, FPS sampling can
+    # bias the very first pick into the passage.
+    if min_free_area_m2 > 0 and free.any():
+        min_free_cells = int(np.ceil(min_free_area_m2 / (cell_size_m ** 2)))
+        n_free_before = int(free.sum())
+        free, free_areas = _keep_components_above_area(free, min_free_cells)
+        n_free_after = int(free.sum())
+        free_areas_m2 = [a * cell_size_m ** 2 for a in free_areas]
+        print(
+            f"[placement] free-region filter: kept "
+            f"{len(free_areas)} component(s) ≥ {min_free_area_m2:.2f} m² "
+            f"(areas = {[round(a, 2) for a in free_areas_m2]} m²); "
+            f"{n_free_before - n_free_after} cells dropped"
+        )
 
     iy, ix = np.where(free)
     if len(ix) == 0:

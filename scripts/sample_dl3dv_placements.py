@@ -188,6 +188,15 @@ def main() -> int:
              "morphological closing might bridge to the real room. "
              "Pass 0 to disable. Default 3 m² ≈ smallest plausible room.",
     )
+    p.add_argument(
+        "--min-free-area-m2", type=float, default=1.0,
+        help="drop tiny components from the FINAL free-region mask "
+             "(after low/high obstacle erosion). Catches the 'doorway "
+             "peninsula' failure mode where a thin passage between "
+             "rooms survives the floor-component filter but only "
+             "contributes a thin sliver of valid placement cells. "
+             "Pass 0 to disable. Default 1 m² ≈ a few placements' worth.",
+    )
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -238,6 +247,7 @@ def main() -> int:
         max_camera_distance_m=args.max_distance_to_camera,
         camera_floor_radius_m=args.camera_floor_radius,
         min_floor_area_m2=args.min_floor_area_m2,
+        min_free_area_m2=args.min_free_area_m2,
     )
 
     out_json = scene_dir / "placements.json"

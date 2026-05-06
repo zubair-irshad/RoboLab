@@ -44,6 +44,7 @@
 #   TABLE_HEIGHT_M   (0.75)                 split between low-obstacle and high-obstacle bands (m).
 #   FLOOR_CLOSE_M    (1.0)                  morph-closing radius on the floor mask (m). Higher bridges floor gaps where furniture occluded capture.
 #   MIN_FLOOR_AREA_M2 (3.0)                  drop floor connected-components smaller than this (m²). Filters RANSAC false-positives in adjacent rooms / on furniture. Set 0 to disable.
+#   MIN_FREE_AREA_M2  (1.0)                  drop tiny components from the FINAL free-placement mask. Catches the 'doorway peninsula' failure mode where a passage survives the floor-area filter but yields only a sliver of valid cells. Set 0 to disable.
 #   THREEDGRUT_REPO  (third_party/3dgrut)   local clone of nv-tlabs/3dgrut
 #   THREEDGRUT_ENV   ("")                   conda env for 3DGUT (empty = current env)
 #   SKIP_PREP        (0)                    set 1 to skip prepare_marble_scene
@@ -81,6 +82,7 @@ CLEARANCE_M="${CLEARANCE_M:-1.8}"
 TABLE_HEIGHT_M="${TABLE_HEIGHT_M:-0.75}"
 FLOOR_CLOSE_M="${FLOOR_CLOSE_M:-1.0}"
 MIN_FLOOR_AREA_M2="${MIN_FLOOR_AREA_M2:-3.0}"
+MIN_FREE_AREA_M2="${MIN_FREE_AREA_M2:-1.0}"
 THREEDGRUT_REPO="${THREEDGRUT_REPO:-third_party/3dgrut}"
 THREEDGRUT_ENV="${THREEDGRUT_ENV:-}"
 SKIP_PREP="${SKIP_PREP:-0}"
@@ -188,6 +190,7 @@ else
         --table-height "$TABLE_HEIGHT_M" \
         --floor-close-radius "$FLOOR_CLOSE_M" \
         --min-floor-area-m2 "$MIN_FLOOR_AREA_M2" \
+        --min-free-area-m2 "$MIN_FREE_AREA_M2" \
         --camera-floor-radius 0
 fi
 
