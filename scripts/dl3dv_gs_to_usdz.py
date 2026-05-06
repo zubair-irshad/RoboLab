@@ -56,10 +56,26 @@ def _discover_latest_gs_ply(scene_dir: Path) -> Path:
     return candidates[0]
 
 
-def _conda_run(env: str, cwd: Path, cmd: list[str]) -> None:
-    if shutil.which("conda") is None:
-        raise RuntimeError("conda not on PATH; cannot activate 3DGUT env")
-    full = ["conda", "run", "--no-capture-output", "-n", env, *cmd]
+def _run(env: str | None, cwd: Path, cmd: list[str]) -> None:
+    """Run ``cmd`` either in the current Python env or via ``conda run``.
+
+    Pass ``env=None`` (or empty string) to use the current shell's
+    Python (sys.executable). Useful when 3DGUT is already installed in
+    the active env (e.g. our ``robolab`` env). Otherwise, ``env`` is a
+    conda env name and we activate it via ``conda run``.
+    """
+    if not env:
+        # Use the current interpreter explicitly so conda env state and
+        # PYTHONPATH come from where the user invoked us. cmd[0] is
+        # "python"; replace it with sys.executable.
+        full = [sys.executable] + cmd[1:]
+    else:
+        if shutil.which("conda") is None:
+            raise RuntimeError(
+                "conda not on PATH but --conda-env was set; either install conda "
+                "or pass --conda-env '' to run in the current Python env."
+            )
+        full = ["conda", "run", "--no-capture-output", "-n", env, *cmd]
     print(f"[gs→usdz] $ (cwd={cwd}) {' '.join(full)}", flush=True)
     subprocess.run(full, cwd=str(cwd), check=True)
 
@@ -73,8 +89,14 @@ def main() -> int:
                    help="local clone of nv-tlabs/3dgrut. We `cd` here before "
                         "invoking the python module so it picks up the right "
                         "PYTHONPATH.")
-    p.add_argument("--conda-env", default="3dgrut",
-                   help="conda env name where 3DGUT + its deps are installed")
+    p.add_argument(
+        "--conda-env", default="",
+        help="conda env name where 3DGUT + its deps are installed. Pass an "
+             "empty string (default) to run in the current Python env — "
+             "useful when 3DGUT is already installed where you ran this "
+             "script. Set to e.g. '3dgrut' to activate a separate env via "
+             "`conda run`.",
+    )
     p.add_argument("--out-name", default="gaussians.usdz",
                    help="filename written next to mesh_aligned.* under scene-dir")
     p.add_argument("--ply", type=Path, default=None,
@@ -107,7 +129,7 @@ def main() -> int:
     ]
     print(f"[gs→usdz] input  : {ply}")
     print(f"[gs→usdz] output : {out_usdz}")
-    _conda_run(args.conda_env, repo, cmd)
+    _run(args.conda_env, repo, cmd)
 
     if not out_usdz.is_file() or out_usdz.stat().st_size == 0:
         raise RuntimeError(
