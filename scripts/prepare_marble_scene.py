@@ -256,56 +256,95 @@ def _read_ply_points(
 def auto_detect_up_axis(
     points: np.ndarray, *,
     floor_inlier_thresh_frac: float = 0.01,
+    near_floor_band_frac: float = 0.15,
     rng_seed: int = 0,
-) -> tuple[str, dict[str, float]]:
-    """Pick the axis whose lower-third RANSAC floor has the most inliers.
+) -> tuple[str, dict[str, dict[str, float]]]:
+    """Pick the axis most consistent with floor-down / ceiling-up.
 
-    For each of the 6 candidate world-up directions (±x, ±y, ±z):
-      1. Rotate the cloud so the candidate becomes +Z.
-      2. Run RANSAC on the lower 30% of z (per the existing helper).
-      3. Score = inlier fraction.
+    For each of the 6 candidate world-up directions (±x, ±y, ±z) we
+    rotate the cloud so the candidate becomes +Z, fit a RANSAC floor,
+    and score the candidate by combining two independent signals:
 
-    The candidate with the highest score wins. Tie-breaker prefers the
-    candidate whose median z (above floor) is positive — i.e. the cloud
-    actually extends *upward* away from the floor, not downward (which
-    would mean we picked the ceiling as the floor).
+      1. **Inlier fraction** — how good a horizontal plane the RANSAC
+         floor actually is. Both the true floor *and* the true ceiling
+         tend to score high here (they're both flat, large, horizontal
+         planes), so this signal alone isn't enough — kitchens with
+         flat ceilings routinely have inlier_frac(ceiling) ≈
+         inlier_frac(floor).
 
-    The RANSAC threshold is auto-scaled by the cloud's vertical extent
-    so this works in arbitrary unscaled units.
+      2. **Density-near-floor ratio** — count points in a band just
+         above the fitted "floor" plane vs a band just below the 95th
+         percentile of z (the "ceiling"). In a typical room *much*
+         more geometry sits near the floor (furniture bases, table
+         legs, baseboards, kitchen counters) than near the ceiling
+         (a few fixtures, maybe a fan). If we picked the wrong axis
+         and the fitted "floor" is actually the ceiling, this ratio
+         flips — most of the geometry is now near our "ceiling" (the
+         true floor).
+
+    Final score = ``inlier_frac * density_ratio``. Both signals must
+    be high for a candidate to win, which rules out side-axes (low
+    RANSAC inliers when the room is "tipped on its side") and the
+    inverted up-axis (low density ratio).
+
+    The RANSAC threshold and density band auto-scale with the cloud's
+    vertical extent so this works in arbitrary unscaled units.
     """
     extent = float(np.percentile(points, 95, axis=0).max() -
                    np.percentile(points, 5, axis=0).min())
     thresh = max(extent * floor_inlier_thresh_frac, 1e-6)
+    band = max(extent * near_floor_band_frac, 1e-6)
 
-    scores: dict[str, float] = {}
-    margins: dict[str, float] = {}
+    candidates: dict[str, dict[str, float]] = {}
     for axis_name, world_up in _UP_AXES.items():
         R = _R_align_up_to_z(world_up)
         rotated = points @ R.T
+        rotated_z = rotated[:, 2]
         floor_z, inlier_frac = _ransac_floor_plane(
             rotated, inlier_thresh=thresh, rng_seed=rng_seed,
         )
-        # Margin: 95th percentile of z above the fitted floor. Positive
-        # means the cloud genuinely extends upward; negative means we
-        # locked onto the ceiling and "above" is actually downward.
-        z_above = float(np.percentile(rotated[:, 2], 95) - floor_z)
-        scores[axis_name] = inlier_frac
-        margins[axis_name] = z_above
+        z_top = float(np.percentile(rotated_z, 95))
+        margin = float(z_top - floor_z)
 
-    # Penalize candidates with non-positive upward margin so we don't
-    # accidentally pick the ceiling.
-    ranked = sorted(
-        scores.items(),
-        key=lambda kv: (kv[1] if margins[kv[0]] > 0 else kv[1] - 1.0),
-        reverse=True,
-    )
+        # Density bands: just above the picked floor vs just below the
+        # picked ceiling. Exclude the floor inliers themselves so we
+        # measure the "stuff resting on the floor" not the floor itself.
+        n_near_floor = int(np.sum(
+            (rotated_z > floor_z + thresh) & (rotated_z <= floor_z + band)
+        ))
+        n_near_ceiling = int(np.sum(
+            (rotated_z >= z_top - band) & (rotated_z < z_top - thresh)
+        ))
+        denom = max(n_near_floor + n_near_ceiling, 1)
+        density_ratio = float(n_near_floor) / float(denom)
+
+        score = float(inlier_frac) * density_ratio
+        if margin <= 0:
+            score *= 0.01  # impossible orientation; cloud doesn't extend up
+
+        candidates[axis_name] = {
+            "inlier_frac": float(inlier_frac),
+            "density_ratio": density_ratio,
+            "n_near_floor": float(n_near_floor),
+            "n_near_ceiling": float(n_near_ceiling),
+            "upward_margin": margin,
+            "score": score,
+        }
+
+    ranked = sorted(candidates.items(), key=lambda kv: kv[1]["score"], reverse=True)
     best = ranked[0][0]
-    print("[auto-up] candidates (axis: inlier_frac, upward_margin):")
-    for axis_name, frac in ranked:
-        print(f"           {axis_name:>2s}: inliers={frac:.3f}, "
-              f"upward_margin={margins[axis_name]:+.3f} (units)")
+    print("[auto-up] candidates (axis: score = inlier_frac × density_ratio):")
+    for axis_name, info in ranked:
+        print(
+            f"           {axis_name:>2s}: score={info['score']:.3f}  "
+            f"(inliers={info['inlier_frac']:.3f}, "
+            f"density_ratio={info['density_ratio']:.3f}  "
+            f"[{int(info['n_near_floor'])} near floor / "
+            f"{int(info['n_near_ceiling'])} near ceiling], "
+            f"upward_margin={info['upward_margin']:+.3f})"
+        )
     print(f"[auto-up] selected: {best}")
-    return best, scores
+    return best, candidates
 
 
 # ---- alignment (no-COLMAP variant) -----------------------------------------
@@ -737,8 +776,9 @@ def main() -> int:
         print(f"[prepare-marble] subsampled to {len(points):,} points")
 
     # Up-axis: either explicit (+x, -x, ..., +z, -z) or 'auto' which scans
-    # all 6 candidates and picks the best RANSAC floor.
-    auto_up_scores: dict[str, float] | None = None
+    # all 6 candidates and picks the best floor (combined RANSAC inlier
+    # fraction × density-asymmetry).
+    auto_up_scores: dict[str, dict[str, float]] | None = None
     if args.up_axis == "auto":
         chosen_axis, auto_up_scores = auto_detect_up_axis(points)
     else:
