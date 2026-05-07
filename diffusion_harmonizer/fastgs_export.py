@@ -216,6 +216,21 @@ def _write_empty_points3d_txt(path: Path) -> None:
     )
 
 
+def _random_seed_points(
+    center: np.ndarray,
+    radius: float,
+    count: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    dirs = rng.normal(size=(count, 3)).astype(np.float32)
+    dirs /= np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-12
+    radii = (rng.random((count, 1), dtype=np.float32) ** (1.0 / 3.0)) * float(radius)
+    points = center.astype(np.float32) + dirs * radii
+    colors = np.full((count, 3), 128, dtype=np.uint8)
+    return points, colors
+
+
 # ---- view loading (mirrors nerfstudio_export) -------------------------------
 
 
@@ -310,6 +325,7 @@ def export_env(
     sparse_arc_train_count: int | None = 20,
     underfit_render_count: int | None = 40,
     depth_target_points: int | None = 0,
+    random_seed_points: int = 500,
     seed: int = 42,
 ) -> tuple[Path, list[FastgsStrategyExport]]:
     """Export one env's hemispheric captures into the FastGS COLMAP tree.
@@ -355,10 +371,24 @@ def export_env(
     ns_root = Path(env_artifacts_dir) / "nerfstudio"
     ply_path = ns_root / "depth_init.ply"
     if depth_target_points is not None and depth_target_points <= 0:
-        points_xyz = points_rgb = None
+        if random_seed_points > 0:
+            manifest_path = Path(env_artifacts_dir) / "manifest.json"
+            center = np.array([0.4, 0.0, 0.4], dtype=np.float32)
+            if manifest_path.exists():
+                try:
+                    center = np.asarray(json.loads(manifest_path.read_text()).get("center", center), dtype=np.float32)
+                except Exception:
+                    pass
+            cam_centers = np.stack([v["T"][:3, 3] for v in views], axis=0).astype(np.float32)
+            radius = float(np.median(np.linalg.norm(cam_centers - center[None, :], axis=1)))
+            points_xyz, points_rgb = _random_seed_points(center, max(radius, 0.25), random_seed_points, seed)
+            seed_note = f"using {len(points_xyz)} random non-depth seed point(s)"
+        else:
+            points_xyz = points_rgb = None
+            seed_note = "points3D.txt will be empty"
         print(
             f"[fastgs-export] {env_artifacts_dir.parent.name}: "
-            "depth point seed disabled — points3D.txt will be empty",
+            f"depth point seed disabled — {seed_note}",
             flush=True,
         )
     elif ply_path.exists():

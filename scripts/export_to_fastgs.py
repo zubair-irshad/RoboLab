@@ -50,6 +50,8 @@ def parse_args() -> argparse.Namespace:
                         help="Number of evenly spaced sparse_arc training views.")
     parser.add_argument("--depth-target-points", type=int, default=0,
                         help="Subsample FastGS points3D seed to at most this many points; 0 disables it.")
+    parser.add_argument("--random-seed-points", type=int, default=500,
+                        help="When depth seed is disabled, write this many random non-depth seed points.")
     return parser.parse_args()
 
 
@@ -85,6 +87,7 @@ def main() -> None:
                 sparse_arc_train_count=args.sparse_arc_views,
                 underfit_render_count=args.underfit_render_views,
                 depth_target_points=args.depth_target_points,
+                random_seed_points=args.random_seed_points,
             )
         except Exception as exc:
             summary["envs"][env_name] = {"error": str(exc), "traceback": traceback.format_exc()}
