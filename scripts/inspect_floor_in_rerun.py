@@ -106,7 +106,8 @@ def main() -> int:
         )
 
     metadata = json.loads(meta_path.read_text())
-    print(f"[inspect] scene_hash = {metadata['scene_hash']}")
+    scene_id = metadata.get("scene_hash") or metadata.get("source_ply") or "<unknown>"
+    print(f"[inspect] scene = {scene_id}")
     print(f"[inspect] floor quality (stored) = {metadata['floor_quality_score']:.2f}")
 
     verts = _load_mesh_vertices(mesh_path)
@@ -124,12 +125,18 @@ def main() -> int:
     non_floor_pts = _subsample(non_floor_pts, args.max_points, seed=2)
 
     # Camera centers in aligned frame (re-derived; metadata has no intrinsics).
-    colmap_src = Path(metadata["colmap_source_path"])
-    R_wc, t_wc = _read_images_metadata(colmap_src)
-    T = np.asarray(metadata["world_from_colmap_4x4"])
-    cam_centers = (T[:3, :3] @ t_wc.T).T + T[:3, 3]
-    print(f"[inspect] {len(cam_centers)} cameras, "
-          f"z range [{cam_centers[:, 2].min():.2f}, {cam_centers[:, 2].max():.2f}] m")
+    # Marble / Echo2 scenes have no COLMAP cameras — log an empty array so the
+    # rest of the rerun layout still renders.
+    colmap_src_raw = metadata.get("colmap_source_path")
+    if colmap_src_raw and Path(colmap_src_raw).exists():
+        R_wc, t_wc = _read_images_metadata(Path(colmap_src_raw))
+        T = np.asarray(metadata["world_from_colmap_4x4"])
+        cam_centers = (T[:3, :3] @ t_wc.T).T + T[:3, 3]
+        print(f"[inspect] {len(cam_centers)} cameras, "
+              f"z range [{cam_centers[:, 2].min():.2f}, {cam_centers[:, 2].max():.2f}] m")
+    else:
+        cam_centers = np.empty((0, 3), dtype=np.float64)
+        print("[inspect] no colmap cameras in metadata (marble / echo2 scene?)")
 
     rec = rr.RecordingStream(application_id="inspect_floor_in_rerun")
     if args.save is not None:
