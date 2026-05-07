@@ -18,12 +18,12 @@
 # Usage:
 #     bash scripts/build_artifacts_via_fastgs.sh UtensilsInMugTask [sparse_iterations]
 #
-# Optional second arg overrides --iterations for sparse_arc; underfit always uses 200.
+# Optional second arg overrides --iterations for sparse_arc; underfit always uses 3000.
 
 set -euo pipefail
 
 ENV_NAME="${1:?Usage: $0 <env_name> [sparse_iterations]}"
-ITERS="${2:-3000}"
+ITERS="${2:-7000}"
 FASTGS_REPO="${FASTGS_REPO:-third_party/FastGS}"
 FASTGS_CONDA_ENV="${FASTGS_CONDA_ENV:-fastgs}"
 
@@ -119,10 +119,10 @@ render_one() {
 }
 
 train_one sparse_arc "$ITERS"
-train_one underfit   200
+train_one underfit   3000
 
 render_one sparse_arc "$ITERS"
-render_one underfit   200
+render_one underfit   3000
 
 # Vanilla 3DGS render.py writes to <model>/train/ours_<iter>/{renders,gt}/<NNNNN>.png.
 # FastGS may name those PNGs by render order (00000.png), so relabel them
