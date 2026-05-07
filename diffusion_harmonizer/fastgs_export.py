@@ -303,9 +303,12 @@ def _stage_dataset(
 def export_env(
     env_artifacts_dir: Path,
     output_dir: Path | None = None,
-    sparse_arc_train_fraction: float = 0.25,
+    sparse_arc_train_fraction: float | None = None,
     full_iterations: int = 30000,
-    underfit_iterations: int = 300,
+    underfit_iterations: int = 150,
+    sparse_arc_train_count: int | None = 20,
+    depth_target_points: int | None = 50_000,
+    seed: int = 42,
 ) -> tuple[Path, list[FastgsStrategyExport]]:
     """Export one env's hemispheric captures into the FastGS COLMAP tree.
 
@@ -351,6 +354,11 @@ def export_env(
     ply_path = ns_root / "depth_init.ply"
     if ply_path.exists():
         points_xyz, points_rgb = _read_ply_xyz_rgb(ply_path)
+        if depth_target_points is not None and len(points_xyz) > depth_target_points:
+            rng = np.random.default_rng(seed)
+            idx = rng.choice(len(points_xyz), size=depth_target_points, replace=False)
+            points_xyz = points_xyz[idx]
+            points_rgb = points_rgb[idx]
         print(
             f"[fastgs-export] {env_artifacts_dir.parent.name}: "
             f"seeding points3D.txt from {ply_path.name} ({len(points_xyz)} points)",
@@ -365,7 +373,11 @@ def export_env(
         )
 
     n = len(views)
-    arc_n = min(n, max(1, int(round(n * sparse_arc_train_fraction))))
+    if sparse_arc_train_count is not None:
+        arc_n = min(n, max(1, int(sparse_arc_train_count)))
+    else:
+        fraction = 1.0 / 6.0 if sparse_arc_train_fraction is None else sparse_arc_train_fraction
+        arc_n = min(n, max(1, int(round(n * fraction))))
     arc_train_indices = set(np.linspace(0, n - 1, arc_n, dtype=int).tolist())
     arc_train = [views[i] for i in sorted(arc_train_indices)]
     arc_render = [v for i, v in enumerate(views) if i not in arc_train_indices]
@@ -458,7 +470,7 @@ def export_env(
 def export_all(
     output_root: Path,
     full_iterations: int = 30000,
-    underfit_iterations: int = 300,
+    underfit_iterations: int = 150,
 ) -> dict[str, list[FastgsStrategyExport]]:
     output_root = Path(output_root)
     summary: dict[str, list[FastgsStrategyExport]] = {}

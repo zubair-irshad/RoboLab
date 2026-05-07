@@ -18,7 +18,7 @@
 # Usage:
 #     bash scripts/build_artifacts_via_fastgs.sh UtensilsInMugTask [iterations]
 #
-# Optional second arg overrides --iterations for sparse_arc; underfit always uses 300.
+# Optional second arg overrides --iterations for sparse_arc; underfit always uses 150.
 
 set -euo pipefail
 
@@ -30,6 +30,7 @@ FASTGS_CONDA_ENV="${FASTGS_CONDA_ENV:-fastgs}"
 ROOT="data/diffusion_harmonizer/${ENV_NAME}/01_artifacts_correction"
 FG="${ROOT}/fastgs"
 RUNS="runs_fastgs/${ENV_NAME}"
+PAIRS_ROOT="data/diffusion_harmonizer/${ENV_NAME}/fastgs_demo_pairs"
 
 if [[ ! -d "$FG" ]]; then
     echo "[$ENV_NAME] $FG not found — run scripts/export_to_fastgs.py first." >&2
@@ -118,14 +119,14 @@ render_one() {
 }
 
 train_one sparse_arc "$ITERS"
-train_one underfit   300
+train_one underfit   150
 
 render_one sparse_arc "$ITERS"
-render_one underfit   300
+render_one underfit   150
 
 # Vanilla 3DGS render.py writes to <model>/train/ours_<iter>/{renders,gt}/<NNNNN>.png.
-# pair_splatfacto_renders.py expects <ns_root>/<strategy>/renders/*.png, so we
-# symlink each strategy's render output into that layout before pairing.
+# FastGS may name those PNGs by render order (00000.png), so relabel them
+# back to the COLMAP image names before pairing.
 link_renders() {
     local strategy="$1"
     local out
@@ -134,19 +135,52 @@ link_renders() {
         echo "[$ENV_NAME] no FastGS renders for $strategy under $RUNS/$strategy/train/ — skipping link."
         return
     fi
+    local images_txt="$FG/$strategy/render/sparse/0/images.txt"
+    if [[ ! -f "$images_txt" ]]; then
+        echo "[$ENV_NAME] no render images.txt for $strategy at $images_txt — skipping link."
+        return
+    fi
     local link="$FG/$strategy/renders"
     rm -rf "$link"
-    ln -s "$(realpath "$out/renders")" "$link"
-    echo "[$ENV_NAME] linked $link -> $out/renders"
+    mkdir -p "$link"
+    local i=0
+    local n_linked=0
+    local image_name stem src
+    while read -r image_name; do
+        stem="${image_name%.*}"
+        src="$out/renders/$stem.png"
+        if [[ ! -f "$src" ]]; then
+            src="$out/renders/$image_name"
+        fi
+        if [[ ! -f "$src" ]]; then
+            src="$out/renders/$(printf "%05d" "$i").png"
+        fi
+        if [[ ! -f "$src" ]]; then
+            echo "[$ENV_NAME] WARNING: no render PNG for $strategy image $image_name (render index $i)"
+            i=$((i + 1))
+            continue
+        fi
+        ln -s "$(realpath "$src")" "$link/$stem.png"
+        n_linked=$((n_linked + 1))
+        i=$((i + 1))
+    done < <(awk 'NF >= 10 && $1 !~ /^#/ {print $10}' "$images_txt")
+    echo "[$ENV_NAME] linked $n_linked relabeled render(s) in $link"
 }
 link_renders sparse_arc
 link_renders underfit
 
 echo "[$ENV_NAME] >>> pair"
+rm -rf "$PAIRS_ROOT/sparse_arc" "$PAIRS_ROOT/underfit"
+mkdir -p "$PAIRS_ROOT"
 python scripts/pair_splatfacto_renders.py \
     --ns-root "$FG" \
-    --output-dir "$ROOT" \
-    --strategies sparse_arc underfit \
+    --output-dir "$PAIRS_ROOT/sparse_arc" \
+    --strategies sparse_arc \
+    || echo "[$ENV_NAME] sparse_arc pairing skipped/failed; renders are still under $RUNS"
+python scripts/pair_splatfacto_renders.py \
+    --ns-root "$FG" \
+    --output-dir "$PAIRS_ROOT/underfit" \
+    --strategies underfit \
     || echo "[$ENV_NAME] pairing skipped/failed; renders are still under $RUNS"
 
-echo "[$ENV_NAME] DONE -> $ROOT (model dirs under $RUNS)"
+echo "[$ENV_NAME] DONE -> $PAIRS_ROOT (model dirs under $RUNS)"

@@ -5,7 +5,7 @@
 Reads renders from each strategy's ``ns-render dataset --output-path ...``
 output and emits paired-data dirs of the form::
 
-    <env>/01_artifacts_correction/<NNNN>/{input.png, target.png, comparison.png, metadata.json}
+    <output-dir>/<NNNN>/{input.png, target.png, comparison.png, metadata.json}
 
 per (degraded_strategy, view_id) tuple. ``target`` always comes from the
 reference run (full data, full iterations) so the diffusion model sees a
@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -118,10 +119,10 @@ def _gt_path_for_stem(gt_views_dir: Path, stem: str) -> Path | None:
     them at ``<views>/<NNNN>/rgb.png``. We strip everything but the
     trailing digits to recover the view id.
     """
-    digits = "".join(ch for ch in stem if ch.isdigit())
-    if not digits:
+    match = re.search(r"(\d+)$", stem)
+    if match is None:
         return None
-    view_id = int(digits)
+    view_id = int(match.group(1))
     p = gt_views_dir / f"{view_id:04d}" / "rgb.png"
     return p if p.exists() else None
 
