@@ -13,7 +13,7 @@ Per env, writes::
     ├── images/                          (shared rgb pool)
     ├── fastgs_manifest.json             (read by build_artifacts_via_fastgs.sh)
     ├── full/{train,render}/...          all views, 30k iter reference
-    ├── underfit/{train,render}/...      all views, 150 iter degraded
+    ├── underfit/{train,render}/...      all train views, 40 render views, 200 iter degraded
     └── sparse_arc/{train,render}/...    evenly-spaced sparse holdout (20 train, 100 render)
 
 Each ``train`` / ``render`` subdir is a self-contained COLMAP dataset
@@ -43,10 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env", nargs="*", default=None,
                         help="Restrict to specific env names; default = all envs with a captured snapshot.")
     parser.add_argument("--full-iterations", type=int, default=30000)
-    parser.add_argument("--underfit-iterations", type=int, default=150)
+    parser.add_argument("--underfit-iterations", type=int, default=200)
+    parser.add_argument("--underfit-render-views", type=int, default=40,
+                        help="Number of evenly spaced underfit views to render/pair.")
     parser.add_argument("--sparse-arc-views", type=int, default=20,
                         help="Number of evenly spaced sparse_arc training views.")
-    parser.add_argument("--depth-target-points", type=int, default=50_000,
+    parser.add_argument("--depth-target-points", type=int, default=5_000,
                         help="Subsample FastGS points3D seed to at most this many points.")
     return parser.parse_args()
 
@@ -81,6 +83,7 @@ def main() -> None:
                 full_iterations=args.full_iterations,
                 underfit_iterations=args.underfit_iterations,
                 sparse_arc_train_count=args.sparse_arc_views,
+                underfit_render_count=args.underfit_render_views,
                 depth_target_points=args.depth_target_points,
             )
         except Exception as exc:

@@ -21,7 +21,7 @@ Usage::
 
     # Each degraded variant uses the same command with a different --data dir
     # and (for ``underfit``) a smaller --max-num-iterations:
-    ns-train splatfacto --max-num-iterations 150 \\
+    ns-train splatfacto --max-num-iterations 200 \\
         --data data/diffusion_harmonizer/<env>/01_artifacts_correction/nerfstudio/underfit
 
 The script prints the exact ``ns-train`` and ``ns-render`` commands per
@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
                              "to random init, which converges much slower on object-centric captures.")
     parser.add_argument("--depth-stride", type=int, default=8,
                         help="Pixel stride when back-projecting depth to a point cloud (1 = every pixel).")
-    parser.add_argument("--depth-target-points", type=int, default=50_000,
+    parser.add_argument("--depth-target-points", type=int, default=5_000,
                         help="Subsample the combined point cloud to at most this many points.")
     parser.add_argument("--depth-max", type=float, default=50.0,
                         help="Drop back-projected pixels with depth >= this many meters. "

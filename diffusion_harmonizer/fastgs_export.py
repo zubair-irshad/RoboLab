@@ -41,9 +41,10 @@ COLMAP datasets per strategy::
         ├── images/             (render frames)
         └── sparse/0/{cameras,images,points3D}.txt
 
-For ``full`` / ``underfit`` the two are identical (all frames are train).
 The bash runner trains against ``train/`` and re-renders against
-``render/``. ``points3D.txt`` is seeded from the depth-init PLY produced
+``render/``. ``underfit`` can train on all frames while rendering only an
+evenly spaced subset for paired data. ``points3D.txt`` is seeded from the
+depth-init PLY produced
 by ``nerfstudio_export.py``; we re-use that file rather than re-running
 the back-projection.
 
@@ -305,9 +306,10 @@ def export_env(
     output_dir: Path | None = None,
     sparse_arc_train_fraction: float | None = None,
     full_iterations: int = 30000,
-    underfit_iterations: int = 150,
+    underfit_iterations: int = 200,
     sparse_arc_train_count: int | None = 20,
-    depth_target_points: int | None = 50_000,
+    underfit_render_count: int | None = 40,
+    depth_target_points: int | None = 5_000,
     seed: int = 42,
 ) -> tuple[Path, list[FastgsStrategyExport]]:
     """Export one env's hemispheric captures into the FastGS COLMAP tree.
@@ -381,6 +383,12 @@ def export_env(
     arc_train_indices = set(np.linspace(0, n - 1, arc_n, dtype=int).tolist())
     arc_train = [views[i] for i in sorted(arc_train_indices)]
     arc_render = [v for i, v in enumerate(views) if i not in arc_train_indices]
+    if underfit_render_count is not None:
+        underfit_render_n = min(n, max(1, int(underfit_render_count)))
+        underfit_render_indices = set(np.linspace(0, n - 1, underfit_render_n, dtype=int).tolist())
+        underfit_render = [views[i] for i in sorted(underfit_render_indices)]
+    else:
+        underfit_render = views
     sorted_ids = [v["view_id"] for v in views]
 
     strategies: list[FastgsStrategyExport] = []
@@ -422,11 +430,12 @@ def export_env(
     write_strategy(
         "underfit",
         train_views=views,
-        render_views=views,
+        render_views=underfit_render,
         iterations=underfit_iterations,
         note=(
             f"All {n} views as train, but stop after {underfit_iterations} "
-            "iterations — densification cuts off early so renders show "
+            f"iterations and render {len(underfit_render)} evenly spaced "
+            "poses — densification cuts off early so renders show "
             "missing fine detail. Degraded variant for paired data."
         ),
     )
@@ -470,7 +479,7 @@ def export_env(
 def export_all(
     output_root: Path,
     full_iterations: int = 30000,
-    underfit_iterations: int = 150,
+    underfit_iterations: int = 200,
 ) -> dict[str, list[FastgsStrategyExport]]:
     output_root = Path(output_root)
     summary: dict[str, list[FastgsStrategyExport]] = {}

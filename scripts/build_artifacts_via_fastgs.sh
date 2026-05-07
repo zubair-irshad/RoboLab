@@ -16,14 +16,14 @@
 #        python scripts/export_to_fastgs.py    --output-root data/diffusion_harmonizer
 #
 # Usage:
-#     bash scripts/build_artifacts_via_fastgs.sh UtensilsInMugTask [iterations]
+#     bash scripts/build_artifacts_via_fastgs.sh UtensilsInMugTask [sparse_iterations]
 #
-# Optional second arg overrides --iterations for sparse_arc; underfit always uses 150.
+# Optional second arg overrides --iterations for sparse_arc; underfit always uses 200.
 
 set -euo pipefail
 
-ENV_NAME="${1:?Usage: $0 <env_name> [iterations]}"
-ITERS="${2:-30000}"
+ENV_NAME="${1:?Usage: $0 <env_name> [sparse_iterations]}"
+ITERS="${2:-3000}"
 FASTGS_REPO="${FASTGS_REPO:-third_party/FastGS}"
 FASTGS_CONDA_ENV="${FASTGS_CONDA_ENV:-fastgs}"
 
@@ -110,8 +110,8 @@ render_one() {
     model_abs=$(realpath "$model")
     echo "[$ENV_NAME] >>> fastgs render $strategy"
     # Vanilla 3DGS render.py loads gaussians from --model_path and reads
-    # cameras from --source_path. For sparse_arc, export_to_fastgs.py writes
-    # only held-out poses under render/; underfit keeps all poses.
+    # cameras from --source_path. export_to_fastgs.py writes only sparse
+    # holdout poses for sparse_arc and an evenly spaced subset for underfit.
     (cd "$FASTGS_REPO" && python render.py \
         --source_path "$src_abs" \
         --model_path "$model_abs" \
@@ -119,10 +119,10 @@ render_one() {
 }
 
 train_one sparse_arc "$ITERS"
-train_one underfit   150
+train_one underfit   200
 
 render_one sparse_arc "$ITERS"
-render_one underfit   150
+render_one underfit   200
 
 # Vanilla 3DGS render.py writes to <model>/train/ours_<iter>/{renders,gt}/<NNNNN>.png.
 # FastGS may name those PNGs by render order (00000.png), so relabel them

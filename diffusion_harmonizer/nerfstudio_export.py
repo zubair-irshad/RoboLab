@@ -172,7 +172,7 @@ def _build_combined_pointcloud(
     views: list[dict],
     output_path: Path,
     stride: int = 8,
-    target_points: int = 50_000,
+    target_points: int = 5_000,
     seed: int = 42,
     depth_max: float = 50.0,
     bg_sphere_center: tuple[float, float, float] = (0.4, 0.0, 0.4),
@@ -336,7 +336,7 @@ def export_env(
     seed: int = 42,
     with_depth_init: bool = True,
     depth_stride: int = 8,
-    depth_target_points: int = 50_000,
+    depth_target_points: int = 5_000,
     depth_max: float = 50.0,
     bg_sphere_radius: float = 4.0,
     bg_sphere_points: int = 20_000,
@@ -505,10 +505,10 @@ def export_env(
         eval_ids=None,
         note=(
             "All views as train, deliberately undertrained. Pass --max-num-iterations "
-            "150 so densification stops before the model converges; renders show "
+            "200 so densification stops before the model converges; renders show "
             "spurious geometry and missing details across the whole hemisphere."
         ),
-        ns_train_args="splatfacto --max-num-iterations 150",
+        ns_train_args="splatfacto --max-num-iterations 200",
     )
 
     return output_dir, strategies
