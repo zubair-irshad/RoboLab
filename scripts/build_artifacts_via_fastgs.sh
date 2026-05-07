@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: CC-BY-NC-4.0
 #
-# End-to-end FastGS path: train (3x) + render (3x) + pair, mirroring
+# End-to-end FastGS path: train sparse/underfit + render + pair, mirroring
 # build_artifacts_via_nerfstudio.sh but for graphdeco-inria-style 3DGS.
 #
 # Prereqs (one-time):
@@ -18,8 +18,7 @@
 # Usage:
 #     bash scripts/build_artifacts_via_fastgs.sh UtensilsInMugTask [iterations]
 #
-# Optional second arg overrides --iterations for the heavy strategies
-# (full + sparse_arc); underfit always uses 1500.
+# Optional second arg overrides --iterations for sparse_arc; underfit always uses 300.
 
 set -euo pipefail
 
@@ -110,22 +109,19 @@ render_one() {
     model_abs=$(realpath "$model")
     echo "[$ENV_NAME] >>> fastgs render $strategy"
     # Vanilla 3DGS render.py loads gaussians from --model_path and reads
-    # cameras from --source_path. Pointing at the render/ dataset (all
-    # hemisphere poses) re-renders the trained model at every captured
-    # viewpoint, including the sparse_arc held-out sector.
+    # cameras from --source_path. For sparse_arc, export_to_fastgs.py writes
+    # only held-out poses under render/; underfit keeps all poses.
     (cd "$FASTGS_REPO" && python render.py \
         --source_path "$src_abs" \
         --model_path "$model_abs" \
         --iteration "$iters")
 }
 
-train_one full       "$ITERS"
 train_one sparse_arc "$ITERS"
-train_one underfit   1500
+train_one underfit   300
 
-render_one full       "$ITERS"
 render_one sparse_arc "$ITERS"
-render_one underfit   1500
+render_one underfit   300
 
 # Vanilla 3DGS render.py writes to <model>/train/ours_<iter>/{renders,gt}/<NNNNN>.png.
 # pair_splatfacto_renders.py expects <ns_root>/<strategy>/renders/*.png, so we
@@ -143,7 +139,6 @@ link_renders() {
     ln -s "$(realpath "$out/renders")" "$link"
     echo "[$ENV_NAME] linked $link -> $out/renders"
 }
-link_renders full
 link_renders sparse_arc
 link_renders underfit
 

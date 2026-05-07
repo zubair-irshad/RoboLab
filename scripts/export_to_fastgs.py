@@ -13,8 +13,8 @@ Per env, writes::
     ├── images/                          (shared rgb pool)
     ├── fastgs_manifest.json             (read by build_artifacts_via_fastgs.sh)
     ├── full/{train,render}/...          all views, 30k iter reference
-    ├── underfit/{train,render}/...      all views, 1500 iter degraded
-    └── sparse_arc/{train,render}/...    contiguous-arc holdout (40 train, 120 render)
+    ├── underfit/{train,render}/...      all views, 300 iter degraded
+    └── sparse_arc/{train,render}/...    evenly-spaced sparse holdout (30 train, 90 render)
 
 Each ``train`` / ``render`` subdir is a self-contained COLMAP dataset
 (``images/`` + ``sparse/0/{cameras,images,points3D}.txt``).
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env", nargs="*", default=None,
                         help="Restrict to specific env names; default = all envs with a captured snapshot.")
     parser.add_argument("--full-iterations", type=int, default=30000)
-    parser.add_argument("--underfit-iterations", type=int, default=1500)
+    parser.add_argument("--underfit-iterations", type=int, default=300)
     return parser.parse_args()
 
 

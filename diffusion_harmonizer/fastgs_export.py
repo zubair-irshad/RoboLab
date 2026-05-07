@@ -30,15 +30,15 @@ Some DIFIX3D+ strategies hold out part of the spiral as eval frames. The
 held-out frames must (a) be *excluded* from the training source_path so
 3DGS doesn't fit them, but (b) still rendered post-training so we can
 build paired data. Vanilla 3DGS' ``--eval`` flag splits by every-8th
-index, which doesn't match our contiguous-arc holdout — so we emit two
-sibling COLMAP datasets per strategy::
+index, which doesn't match our sparse holdout — so we emit two sibling
+COLMAP datasets per strategy::
 
     <strategy_dir>/
     ├── train/
     │   ├── images/             (only train frames)
     │   └── sparse/0/{cameras,images,points3D}.txt
     └── render/
-        ├── images/             (all frames)
+        ├── images/             (render frames)
         └── sparse/0/{cameras,images,points3D}.txt
 
 For ``full`` / ``underfit`` the two are identical (all frames are train).
@@ -269,6 +269,11 @@ def _stage_dataset(
 ) -> None:
     """Write images/ + sparse/0/ for one COLMAP dataset."""
 
+    if dataset_dir.exists() or dataset_dir.is_symlink():
+        if dataset_dir.is_symlink() or dataset_dir.is_file():
+            dataset_dir.unlink()
+        else:
+            shutil.rmtree(dataset_dir)
     images_dir = dataset_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
     # Stage per-view symlinks pointing into the shared pool. Frame names match
@@ -298,9 +303,9 @@ def _stage_dataset(
 def export_env(
     env_artifacts_dir: Path,
     output_dir: Path | None = None,
-    sparse_arc_train_fraction: float = 1.0 / 3.0,
+    sparse_arc_train_fraction: float = 0.25,
     full_iterations: int = 30000,
-    underfit_iterations: int = 1500,
+    underfit_iterations: int = 300,
 ) -> tuple[Path, list[FastgsStrategyExport]]:
     """Export one env's hemispheric captures into the FastGS COLMAP tree.
 
@@ -360,8 +365,10 @@ def export_env(
         )
 
     n = len(views)
-    arc_n = max(1, int(round(n * sparse_arc_train_fraction)))
-    arc_train = views[:arc_n]
+    arc_n = min(n, max(1, int(round(n * sparse_arc_train_fraction))))
+    arc_train_indices = set(np.linspace(0, n - 1, arc_n, dtype=int).tolist())
+    arc_train = [views[i] for i in sorted(arc_train_indices)]
+    arc_render = [v for i, v in enumerate(views) if i not in arc_train_indices]
     sorted_ids = [v["view_id"] for v in views]
 
     strategies: list[FastgsStrategyExport] = []
@@ -414,13 +421,13 @@ def export_env(
     write_strategy(
         "sparse_arc",
         train_views=arc_train,
-        render_views=views,
+        render_views=arc_render,
         iterations=full_iterations,
         note=(
-            f"Train on the first {len(arc_train)}/{n} contiguous views of the "
-            "Fibonacci spiral; render at all spiral poses. The held-out angular "
-            "sector is hallucinated by the model — strong DIFIX3D+ sparse-"
-            "reconstruction supervision signal."
+            f"Train on {len(arc_train)}/{n} evenly spaced views of the "
+            f"Fibonacci spiral; render only the {len(arc_render)} held-out "
+            "poses. The held-out views are hallucinated by the model — strong "
+            "DIFIX3D+ sparse-reconstruction supervision signal."
         ),
     )
 
@@ -451,7 +458,7 @@ def export_env(
 def export_all(
     output_root: Path,
     full_iterations: int = 30000,
-    underfit_iterations: int = 1500,
+    underfit_iterations: int = 300,
 ) -> dict[str, list[FastgsStrategyExport]]:
     output_root = Path(output_root)
     summary: dict[str, list[FastgsStrategyExport]] = {}
