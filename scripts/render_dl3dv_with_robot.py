@@ -98,6 +98,21 @@ parser.add_argument(
     "--no-depth", action="store_true",
     help="skip the depth pass (rgb only — faster).",
 )
+parser.add_argument(
+    "--artifact-output-root", type=Path, default=None,
+    help="if set, ALSO write the views in artifact-pipeline format under "
+         "<root>/<env-name>/01_artifacts_correction/views/<NNNN>/{rgb.png, "
+         "depth.npy, intrinsics.json, extrinsics.json} + manifest.json — "
+         "the same layout capture_artifact_views.py emits, so "
+         "scripts/export_to_fastgs.py + build_artifacts_via_fastgs.sh "
+         "consume it directly. The legacy <NNNN>_rgb.png pattern keeps "
+         "writing alongside.",
+)
+parser.add_argument(
+    "--artifact-env-name", default=None,
+    help="override the env name used as the FastGS env directory. "
+         "Defaults to <task>__<scene-id>__pl_<idx>.",
+)
 parser.add_argument("--no-headless", dest="headless_override",
                     action="store_false", default=True)
 parser.add_argument("--num-envs", type=int, default=1)
@@ -490,6 +505,8 @@ def main() -> int:
         f"placement_{args_cli.placement_idx:02d}"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
+    views_dir = out_dir / "views"
+    views_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "placement.json").write_text(json.dumps(pl, indent=2))
     (out_dir / "render_meta.json").write_text(json.dumps({
         "task": args_cli.task,
@@ -501,12 +518,35 @@ def main() -> int:
         "M_visual": M_visual.tolist(),
     }, indent=2))
 
+    # Optional artifact-views mirror: write the same per-view layout
+    # capture_artifact_views.py emits, so export_to_fastgs.py +
+    # build_artifacts_via_fastgs.sh consume it directly.
+    artifact_dir: Path | None = None
+    artifact_views_dir: Path | None = None
+    if args_cli.artifact_output_root is not None:
+        env_name = args_cli.artifact_env_name or (
+            f"{args_cli.task}__{scene_dir.name}__pl_{args_cli.placement_idx:02d}"
+        )
+        artifact_dir = (
+            args_cli.artifact_output_root.resolve()
+            / env_name / "01_artifacts_correction"
+        )
+        artifact_views_dir = artifact_dir / "views"
+        artifact_views_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            f"[render] artifact-views mirror: {artifact_dir}\n"
+            f"           env_name = {env_name!r}\n"
+            f"           feed to: scripts/export_to_fastgs.py "
+            f"--output-root {args_cli.artifact_output_root}"
+        )
+
     eyes = _fibonacci_hemisphere_eyes(
         args_cli.num_views, args_cli.radius_range,
         np.asarray(args_cli.center), args_cli.seed,
     )
     target = np.asarray(args_cli.center)
 
+    manifest_views: list[dict] = []
     for i, eye in enumerate(eyes):
         quat = _look_at_quat_wxyz(eye, target)
         pos_t = torch.tensor(eye, device=env.device, dtype=torch.float32).unsqueeze(0)
@@ -528,7 +568,60 @@ def main() -> int:
         arr = rgb[0].detach().cpu().numpy()
         if arr.shape[-1] == 4:
             arr = arr[..., :3]
+        # Normalize to uint8 for both layouts.
+        if arr.dtype != np.uint8:
+            if float(arr.max()) <= 1.0 + 1e-6:
+                arr = arr * 255.0
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+        # Legacy flat-file layout (kept for backward compatibility).
         save_png(out_dir / f"{i:04d}_rgb.png", arr)
+        # Per-view subdir layout (artifact-views format).
+        view_subdir = views_dir / f"{i:04d}"
+        view_subdir.mkdir(parents=True, exist_ok=True)
+        save_png(view_subdir / "rgb.png", arr)
+
+        # Intrinsics + extrinsics: write for both views_dir and (optionally)
+        # the artifact mirror. Build world_T_cam_gl from the same look-at
+        # math we drove the camera with — Isaac Lab's data.pos_w/quat_w
+        # round-trip is in a different convention and would mis-name the
+        # OpenGL frame.
+        try:
+            K = (
+                base_cam.data.intrinsic_matrices[0]
+                .detach().cpu().numpy().astype(np.float32)
+            )
+        except Exception as exc:
+            if i == 0:
+                print(f"[render] WARN: couldn't read intrinsics ({exc}); "
+                      f"intrinsics.json will use a zero matrix")
+            K = np.zeros((3, 3), dtype=np.float32)
+        world_T_cam = np.eye(4, dtype=np.float64)
+        # Replicate the look-at OpenGL frame from the eye+target+up triple.
+        f = (target - eye); f /= max(float(np.linalg.norm(f)), 1e-12)
+        r = np.cross(f, np.array([0.0, 0.0, 1.0]))
+        r /= max(float(np.linalg.norm(r)), 1e-12)
+        u = np.cross(r, f)
+        world_T_cam[:3, :3] = np.stack([r, u, -f], axis=1)
+        world_T_cam[:3, 3] = eye
+
+        (view_subdir / "intrinsics.json").write_text(
+            json.dumps({"K": K.tolist()})
+        )
+        (view_subdir / "extrinsics.json").write_text(
+            json.dumps({"world_T_cam_gl": world_T_cam.tolist()})
+        )
+
+        if artifact_views_dir is not None:
+            mirror_view = artifact_views_dir / f"{i:04d}"
+            mirror_view.mkdir(parents=True, exist_ok=True)
+            save_png(mirror_view / "rgb.png", arr)
+            (mirror_view / "intrinsics.json").write_text(
+                json.dumps({"K": K.tolist()})
+            )
+            (mirror_view / "extrinsics.json").write_text(
+                json.dumps({"world_T_cam_gl": world_T_cam.tolist()})
+            )
 
         # ---- depth pass (optional): collider visible, rasterized depth ----
         if not args_cli.no_depth:
@@ -540,6 +633,9 @@ def main() -> int:
             if depth_t is not None:
                 depth_np = depth_t[0].detach().cpu().numpy()
                 np.save(out_dir / f"{i:04d}_depth.npy", depth_np)
+                np.save(view_subdir / "depth.npy", depth_np)
+                if artifact_views_dir is not None:
+                    np.save(artifact_views_dir / f"{i:04d}" / "depth.npy", depth_np)
             else:
                 if i == 0:
                     print(
@@ -549,7 +645,34 @@ def main() -> int:
             if use_gs:
                 runtime.set_collider_for_depth_pass(False)
 
+        manifest_views.append({"view_id": i, "dir": f"views/{i:04d}"})
+
+    # Write manifests in both layouts.
+    manifest = {
+        "env_name": args_cli.task,
+        "scene_dir": str(scene_dir),
+        "placement_idx": args_cli.placement_idx,
+        "placement": pl,
+        "num_views": len(manifest_views),
+        "resolution": list(args_cli.resolution),
+        "spp": args_cli.spp,
+        "center": list(args_cli.center),
+        "radius_range": list(args_cli.radius_range),
+        "use_gs": use_gs,
+        "views": manifest_views,
+    }
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    if artifact_dir is not None:
+        (artifact_dir / "manifest.json").write_text(
+            json.dumps({**manifest, "env_name": (
+                args_cli.artifact_env_name or
+                f"{args_cli.task}__{scene_dir.name}__pl_{args_cli.placement_idx:02d}"
+            )}, indent=2)
+        )
+
     print(f"[render] wrote {len(eyes)} views to {out_dir}")
+    if artifact_dir is not None:
+        print(f"[render] artifact-views mirror at {artifact_dir}")
     runtime.set_background_scene(None)
     runtime.close()
     return 0

@@ -156,6 +156,11 @@ else
     echo
     echo "[3/5] === mesh_aligned.ply -> mesh_aligned.usd ==="
     python scripts/dl3dv_mesh_to_usd.py --scene-dir "$OUT"
+    # The artifact_capture pipeline looks for a sibling `*_collider.*` next
+    # to the marble USDZ when the BG is NuRec (so the depth pass can hit a
+    # polygon proxy). Expose mesh_aligned.usd under the expected name.
+    ln -sf "mesh_aligned.usd" "$OUT/gaussians_collider.usd"
+    echo "[3/5] linked $OUT/gaussians_collider.usd -> mesh_aligned.usd"
 fi
 
 # ------ 4: source PLY -> gaussians.usdz (3DGUT) ----------------------------
