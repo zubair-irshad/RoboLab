@@ -45,7 +45,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sparse-k", type=int, default=24,
                         help="Number of views the sparse_k strategy keeps.")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--no-depth-init", dest="with_depth_init", action="store_false", default=True,
+    parser.add_argument("--with-depth-init", dest="with_depth_init", action="store_true", default=False,
+                        help="Build and reference the combined depth-back-projected PLY.")
+    parser.add_argument("--no-depth-init", dest="with_depth_init", action="store_false",
                         help="Skip the combined depth-back-projected PLY. Splatfacto will fall back "
                              "to random init, which converges much slower on object-centric captures.")
     parser.add_argument("--depth-stride", type=int, default=8,

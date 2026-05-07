@@ -48,8 +48,8 @@ def parse_args() -> argparse.Namespace:
                         help="Number of evenly spaced underfit views to render/pair.")
     parser.add_argument("--sparse-arc-views", type=int, default=20,
                         help="Number of evenly spaced sparse_arc training views.")
-    parser.add_argument("--depth-target-points", type=int, default=5_000,
-                        help="Subsample FastGS points3D seed to at most this many points.")
+    parser.add_argument("--depth-target-points", type=int, default=0,
+                        help="Subsample FastGS points3D seed to at most this many points; 0 disables it.")
     return parser.parse_args()
 
 

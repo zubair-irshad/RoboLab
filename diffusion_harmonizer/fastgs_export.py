@@ -309,7 +309,7 @@ def export_env(
     underfit_iterations: int = 200,
     sparse_arc_train_count: int | None = 20,
     underfit_render_count: int | None = 40,
-    depth_target_points: int | None = 5_000,
+    depth_target_points: int | None = 0,
     seed: int = 42,
 ) -> tuple[Path, list[FastgsStrategyExport]]:
     """Export one env's hemispheric captures into the FastGS COLMAP tree.
@@ -349,12 +349,19 @@ def export_env(
     for v in views:
         _link_or_copy(image_pool / f"frame_{v['view_id']:04d}.png", v["rgb_path"])
 
-    # Re-use the depth-back-projected PLY that ``nerfstudio_export`` already
-    # built (same back-projection math, same world frame). Falls back to an
-    # empty points3D.txt — vanilla 3DGS will then random-init.
+    # Optionally re-use the depth-back-projected PLY that ``nerfstudio_export``
+    # built. By default this is disabled so sparse/underfit train without a
+    # depth-derived point seed and expose stronger rendering artifacts.
     ns_root = Path(env_artifacts_dir) / "nerfstudio"
     ply_path = ns_root / "depth_init.ply"
-    if ply_path.exists():
+    if depth_target_points is not None and depth_target_points <= 0:
+        points_xyz = points_rgb = None
+        print(
+            f"[fastgs-export] {env_artifacts_dir.parent.name}: "
+            "depth point seed disabled — points3D.txt will be empty",
+            flush=True,
+        )
+    elif ply_path.exists():
         points_xyz, points_rgb = _read_ply_xyz_rgb(ply_path)
         if depth_target_points is not None and len(points_xyz) > depth_target_points:
             rng = np.random.default_rng(seed)
