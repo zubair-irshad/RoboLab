@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import sys
 import traceback
@@ -59,6 +60,10 @@ def parse_args() -> argparse.Namespace:
                         help="Sub-directory under each strategy that holds ns-render output PNGs.")
     parser.add_argument("--max-pairs", type=int, default=None,
                         help="Cap total pairs across all strategies (per env).")
+    parser.add_argument("--sample-pairs", type=int, default=None,
+                        help="Randomly sample this many matched render stems per strategy before writing pairs.")
+    parser.add_argument("--sample-seed", type=int, default=42,
+                        help="Seed for --sample-pairs.")
     parser.add_argument(
         "--target-source", choices=("reference", "gt"), default="gt",
         help="Where the 'target' (clean) image comes from. "
@@ -181,6 +186,8 @@ def main() -> None:
                 stem for stem in deg_renders.keys()
                 if _gt_path_for_stem(gt_views_dir, stem) is not None
             )
+        if args.sample_pairs is not None and len(matched_stems) > args.sample_pairs:
+            matched_stems = sorted(random.Random(args.sample_seed).sample(matched_stems, args.sample_pairs))
         print(f"[pair] {strategy}: {len(matched_stems)} matched view(s) "
               f"({'reference' if target_mode == 'reference' else 'gt'} target)",
               flush=True)

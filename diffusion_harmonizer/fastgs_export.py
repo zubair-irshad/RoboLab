@@ -321,7 +321,7 @@ def export_env(
     output_dir: Path | None = None,
     sparse_arc_train_fraction: float | None = None,
     full_iterations: int = 7000,
-    underfit_iterations: int = 3000,
+    underfit_iterations: int = 800,
     sparse_arc_train_count: int | None = 20,
     underfit_render_count: int | None = 40,
     depth_target_points: int | None = 0,
@@ -516,7 +516,7 @@ def export_env(
 def export_all(
     output_root: Path,
     full_iterations: int = 7000,
-    underfit_iterations: int = 3000,
+    underfit_iterations: int = 800,
 ) -> dict[str, list[FastgsStrategyExport]]:
     output_root = Path(output_root)
     summary: dict[str, list[FastgsStrategyExport]] = {}
