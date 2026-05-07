@@ -122,17 +122,49 @@ if [[ ! -d "$ART_DIR/views" ]]; then
     exit 1
 fi
 
-# ------ 2: views → FastGS COLMAP datasets ----------------------------------
+# ------ 2: views → nerfstudio (depth_init.ply) → FastGS COLMAP datasets ----
+# fastgs_export.py SEEDS points3D.txt from <env>/01_artifacts_correction/
+# nerfstudio/depth_init.ply (back-projected depth points). Without that
+# seed FastGS starts with 0 gaussians and the rasterizer crashes with
+# 'CUDA error: invalid configuration argument' on the very first
+# training step. So we always run the nerfstudio export first to build
+# depth_init.ply, then the fastgs export (which is otherwise a cheap
+# JSON / PLY rewrite).
 if [[ "$SKIP_EXPORT" == "1" ]]; then
     echo
-    echo "[2/3] === SKIP_EXPORT=1; reusing existing $ART_DIR/fastgs/ ==="
+    echo "[2/3] === SKIP_EXPORT=1; reusing existing $ART_DIR/{nerfstudio,fastgs}/ ==="
 else
     echo
-    echo "[2/3] === export views → fastgs/{full,underfit,sparse_arc}/ ==="
+    echo "[2/3a] === export views → nerfstudio/ (builds depth_init.ply seed) ==="
+    python scripts/export_to_nerfstudio.py \
+        --output-root "$ARTIFACT_ROOT" \
+        --env "$ENV_NAME"
+
+    if [[ ! -f "$ART_DIR/nerfstudio/depth_init.ply" ]]; then
+        echo "[$ENV_NAME] WARNING: nerfstudio/depth_init.ply was NOT produced."
+        echo "                     FastGS will start with 0 points and CRASH on iter 0."
+        echo "                     Most likely cause: per-view depth.npy missing or all +inf."
+        echo "                     Re-run the render step with --spp >= 16 and check that"
+        echo "                     $ART_DIR/views/0000/depth.npy exists and has finite values."
+    fi
+
+    echo
+    echo "[2/3b] === export views → fastgs/{full,underfit,sparse_arc}/ ==="
     python scripts/export_to_fastgs.py \
         --output-root "$ARTIFACT_ROOT" \
         --env "$ENV_NAME" \
         --full-iterations "$FULL_ITERS"
+
+    # Sanity: confirm the seed actually landed in points3D.txt.
+    pts_file="$ART_DIR/fastgs/full/train/sparse/0/points3D.txt"
+    if [[ -f "$pts_file" ]]; then
+        n_pts=$(wc -l < "$pts_file")
+        echo "[$ENV_NAME] points3D.txt seeded with $n_pts points"
+        if (( n_pts == 0 )); then
+            echo "[$ENV_NAME] ERROR: 0 seed points → FastGS would crash. Aborting."
+            exit 1
+        fi
+    fi
 fi
 
 # ------ 3: train + render + pair (FastGS conda env) ------------------------
@@ -145,9 +177,27 @@ else
     # build_artifacts_via_fastgs.sh hardcodes the pair invocation; we
     # call its train/render half ourselves and then re-pair with the
     # target-source we want.
+    fastgs_rc=0
     FASTGS_REPO="$FASTGS_REPO" FASTGS_CONDA_ENV="$FASTGS_CONDA_ENV" \
-        bash scripts/build_artifacts_via_fastgs.sh "$ENV_NAME" "$FULL_ITERS" || \
-        echo "[$ENV_NAME] FastGS train/render exited non-zero — see logs above"
+        bash scripts/build_artifacts_via_fastgs.sh "$ENV_NAME" "$FULL_ITERS" || fastgs_rc=$?
+    if (( fastgs_rc != 0 )); then
+        echo "[$ENV_NAME] FastGS train/render exited with code $fastgs_rc — see logs above"
+    fi
+    # Concrete success check: did `train.py` actually produce a model?
+    if [[ ! -d "$RUNS_DIR/full/point_cloud" ]]; then
+        echo "[$ENV_NAME] ERROR: $RUNS_DIR/full/point_cloud/ not produced. Train step failed."
+        echo "                 Common causes:"
+        echo "                   - $FASTGS_REPO is not a valid FastGS clone (missing train.py / render.py)"
+        echo "                   - conda env '$FASTGS_CONDA_ENV' missing or broken"
+        echo "                   - CUDA/torch version mismatch inside the env"
+        echo "                 Reproduce manually with verbose output:"
+        echo "                   conda activate $FASTGS_CONDA_ENV"
+        echo "                   cd $FASTGS_REPO && python train.py \\"
+        echo "                       --source_path \$(realpath $ART_DIR/fastgs/full/train) \\"
+        echo "                       --model_path \$(realpath -m $RUNS_DIR/full) \\"
+        echo "                       --iterations $FULL_ITERS"
+        exit 1
+    fi
 
     # Re-pair with the requested target source. The build script already
     # paired against 'full' renders; redo it with --target-source so we
@@ -188,14 +238,29 @@ Inspect the captures + pairs in rerun:
   - if pairs exist: scrub a frustum to see GT rgb / sparse_arc input / sparse_arc target
     side-by-side at the same viewpoint
 
-Inspect FastGS training runs (point at the model dir, not the dataset):
+Inspect FastGS training runs (FastGS is vanilla-3DGS-style: train.py, render.py, no view.py):
 
-    # quick check — list iter checkpoints + a sample render
-    ls $RUNS_DIR/full/point_cloud/
-    ls $RUNS_DIR/full/train/ours_${FULL_ITERS}/renders/ | head -5
+    # 1. Checkpoints + final render PNGs (no extra tooling needed):
+    ls $RUNS_DIR/full/point_cloud/                               # iteration_*  dirs
+    ls $RUNS_DIR/full/train/ours_${FULL_ITERS}/renders/ | head   # rendered PNGs at training viewpoints
+    ls $RUNS_DIR/full/train/ours_${FULL_ITERS}/gt/      | head   # corresponding GT for psnr/lpips comparison
 
-    # rerun the GS in viewer (FastGS-side; activate fastgs env first):
-    cd $FASTGS_REPO && python view.py --model_path \$(realpath $RUNS_DIR/full)
+    # 2. Re-render at any captured viewpoint without retraining
+    #    (activate the fastgs env, then call render.py from inside the FastGS clone):
+    conda activate $FASTGS_CONDA_ENV
+    cd $FASTGS_REPO && python render.py \\
+        --source_path \$(realpath ../../$ART_DIR/fastgs/full/render) \\
+        --model_path  \$(realpath ../../$RUNS_DIR/full) \\
+        --iteration   $FULL_ITERS
+
+    # 3. Interactive 3D viewer for the trained Gaussians:
+    #    FastGS ships SIBR_viewers (C++); follow your FastGS README to build it,
+    #    then point it at $RUNS_DIR/full/point_cloud/iteration_${FULL_ITERS}/point_cloud.ply
+    #    Browser alternative (no build): https://playcanvas.com/supersplat/editor — drag the .ply in.
+
+    # 4. Or load the trained Gaussians into a marble-style scene-dir and re-render with the
+    #    robot via render_dl3dv_with_robot.py (gives you placement-aligned views):
+    #    just rename the trained PLY to point_cloud.ply under fastpgsr/point_cloud/iteration_*/
 
 Inspect a single pair on disk:
 

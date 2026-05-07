@@ -75,10 +75,25 @@ train_one() {
     model_abs=$(realpath -m "$model")
     echo "[$ENV_NAME] >>> fastgs train $strategy ($iters iters)"
     rm -rf "$model"
+    # FastGS / 3DGS caches the parsed point cloud as a binary PLY in TWO
+    # places: the source dir's sparse/0/points3D.ply (alongside the .txt)
+    # and the model dir's input.ply. Both short-circuit re-loads. If a
+    # previous run baked them when points3D.txt was empty / stale, the
+    # cached PLYs stay at 229 bytes and Number-of-points stays 0. Always
+    # nuke them before train so the .txt is re-parsed fresh.
+    rm -f "$src/sparse/0/points3D.ply"
     (cd "$FASTGS_REPO" && python train.py \
         --source_path "$src_abs" \
         --model_path "$model_abs" \
         --iterations "$iters")
+    # Smoke-check: the cache should now reflect the actual point count.
+    if [[ -f "$model/input.ply" ]]; then
+        sz=$(stat -c%s "$model/input.ply" 2>/dev/null || stat -f%z "$model/input.ply" 2>/dev/null)
+        if (( sz < 1024 )); then
+            echo "[$ENV_NAME] WARNING: $model/input.ply is suspiciously small ($sz bytes)" \
+                 "— FastGS may have read an empty/stale points3D.txt."
+        fi
+    fi
 }
 
 render_one() {
